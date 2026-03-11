@@ -1,0 +1,46 @@
+# JudgeGPT — AMD ROCm overlay
+#
+# Requirements:
+#   - ROCm drivers installed: https://rocm.docs.amd.com/en/latest/
+#   - Supported GPU: RX 5000+, RX 6000+, RX 7000+, Instinct MI series
+#   - User in 'video' and 'render' groups:
+#     sudo usermod -aG video,render $USER
+#
+# Works on: Linux with AMD GPU + ROCm
+
+services:
+  ollama:
+    image: ollama/ollama:rocm
+    container_name: judgegpt-ollama
+    ports:
+      - "11435:11434"
+    volumes:
+      - ~/.ollama:/root/.ollama
+    environment:
+      - OLLAMA_HOST=0.0.0.0
+      - OLLAMA_NUM_PARALLEL=4
+      - OLLAMA_MAX_LOADED_MODELS=4
+      - OLLAMA_FLASH_ATTENTION=1
+      - HSA_OVERRIDE_GFX_VERSION=11.0.0   # adjust for your GPU arch if needed
+    devices:
+      - /dev/kfd:/dev/kfd
+      - /dev/dri:/dev/dri
+    group_add:
+      - video
+      - render
+    networks:
+      - judgegpt-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  orchestrator:
+    environment:
+      - NATIVE_OLLAMA_HOST=http://ollama:11434
+    depends_on:
+      ollama:
+        condition: service_healthy

@@ -1,47 +1,151 @@
 #!/usr/bin/env bash
 # JudgeGPT — Start
-# Usage: ./start.sh [up|down|logs]
+# Usage: ./start.sh [up|down|logs|platform] [--platform mac|nvidia|amd|cpu]
 
 set -euo pipefail
-CMD="${1:-up}"
 
-CYN='\033[0;36m'; GRN='\033[0;32m'; YLW='\033[1;33m'; PRP='\033[0;35m'; RST='\033[0m'
+CMD="${1:-up}"
+PLATFORM_OVERRIDE="${2:-}"
+
+CYN='\033[0;36m'
+GRN='\033[0;32m'
+YLW='\033[1;33m'
+PRP='\033[0;35m'
+RED='\033[0;31m'
+RST='\033[0m'
+
+DOCKER="PATH=/usr/local/bin:/usr/bin:/bin docker"
+
+# ── Platform detection ──────────────────────────────────────────────────────
+
+detect_platform() {
+  # Manual override: ./start.sh up --platform nvidia
+  if [[ -n "$PLATFORM_OVERRIDE" ]]; then
+    echo "${PLATFORM_OVERRIDE#--platform=}"
+    return
+  fi
+
+  local os
+  os="$(uname -s)"
+
+  # macOS — always use native Ollama (Metal GPU, no Docker GPU passthrough on Mac)
+  if [[ "$os" == "Darwin" ]]; then
+    echo "mac"
+    return
+  fi
+
+  # NVIDIA GPU — Linux or Windows WSL2
+  if command -v nvidia-smi &>/dev/null && nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | grep -q .; then
+    echo "nvidia"
+    return
+  fi
+
+  # AMD ROCm — Linux with /dev/kfd present
+  if [[ -e /dev/kfd ]]; then
+    echo "amd"
+    return
+  fi
+
+  # CPU fallback — works everywhere
+  echo "cpu"
+}
+
+PLATFORM=$(detect_platform)
+
+compose_cmd() {
+  case "$PLATFORM" in
+    mac)    echo "$DOCKER compose -f docker-compose.yml -f docker-compose.mac.yml" ;;
+    nvidia) echo "$DOCKER compose -f docker-compose.yml -f docker-compose.nvidia.yml" ;;
+    amd)    echo "$DOCKER compose -f docker-compose.yml -f docker-compose.amd.yml" ;;
+    cpu)    echo "$DOCKER compose -f docker-compose.yml -f docker-compose.cpu.yml" ;;
+    *)      echo "$DOCKER compose -f docker-compose.yml -f docker-compose.cpu.yml" ;;
+  esac
+}
+
+COMPOSE=$(compose_cmd)
+
+# ── Commands ────────────────────────────────────────────────────────────────
 
 case "$CMD" in
   up)
-    echo -e "${PRP}⚖  Starting JudgeGPT…${RST}"
+    echo -e "${PRP}⚖  JudgeGPT — platform: ${YLW}${PLATFORM}${RST}"
     echo ""
 
-    # Ensure native Ollama is running (Metal GPU)
-    if ! curl -sf http://localhost:11435 > /dev/null 2>&1; then
-      echo -e "${YLW}Starting native Ollama on port 11435 (Metal GPU)…${RST}"
-      OLLAMA_HOST=0.0.0.0:11435 \
-      OLLAMA_NUM_PARALLEL=4 \
-      OLLAMA_MAX_LOADED_MODELS=4 \
-      OLLAMA_FLASH_ATTENTION=1 \
-      /usr/local/bin/ollama serve > /tmp/ollama-native.log 2>&1 &
-      sleep 2
+    # ── Mac: start native Ollama for Metal GPU ──────────────────────────────
+    if [[ "$PLATFORM" == "mac" ]]; then
+      if ! curl -sf http://localhost:11435 > /dev/null 2>&1; then
+        echo -e "${YLW}Starting native Ollama on :11435 (Metal GPU)…${RST}"
+        OLLAMA_HOST=0.0.0.0:11435 \
+        OLLAMA_NUM_PARALLEL=4 \
+        OLLAMA_MAX_LOADED_MODELS=4 \
+        OLLAMA_FLASH_ATTENTION=1 \
+        /usr/local/bin/ollama serve > /tmp/judgegpt-ollama.log 2>&1 &
+        sleep 2
+        echo -e "${GRN}✓ Ollama started${RST}"
+      else
+        echo -e "${GRN}✓ Native Ollama already running on :11435${RST}"
+      fi
+
+    # ── NVIDIA: verify container toolkit ───────────────────────────────────
+    elif [[ "$PLATFORM" == "nvidia" ]]; then
+      if ! $DOCKER info 2>/dev/null | grep -q "nvidia"; then
+        echo -e "${YLW}⚠  nvidia-container-toolkit not detected in Docker.${RST}"
+        echo -e "   Install guide: ${CYN}https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html${RST}"
+        echo ""
+      fi
+      GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 || echo "unknown")
+      echo -e "${GRN}✓ NVIDIA GPU: ${GPU_NAME}${RST}"
+
+    # ── AMD: verify ROCm devices ────────────────────────────────────────────
+    elif [[ "$PLATFORM" == "amd" ]]; then
+      if [[ ! -e /dev/kfd ]]; then
+        echo -e "${RED}⚠  /dev/kfd not found — ROCm may not be installed.${RST}"
+        echo -e "   Install guide: ${CYN}https://rocm.docs.amd.com/en/latest/deploy/linux/installer/install.html${RST}"
+        echo ""
+      else
+        echo -e "${GRN}✓ AMD ROCm devices found${RST}"
+      fi
+
+    # ── CPU fallback ────────────────────────────────────────────────────────
     else
-      echo -e "${GRN}✓ Native Ollama already running on :11435${RST}"
+      echo -e "${YLW}⚠  CPU mode — no GPU detected. Expect ~2-8 t/s on 7B models.${RST}"
+      echo ""
     fi
 
-    PATH="/usr/local/bin:/usr/bin:/bin" docker compose up --build -d
+    eval "$COMPOSE up --build -d"
+
     echo ""
     echo -e "${GRN}✓ JudgeGPT running${RST}"
-    echo -e "  Dashboard : ${CYN}http://localhost:3000${RST}"
-    echo -e "  API docs  : ${CYN}http://localhost:8080/docs${RST}"
+    echo -e "  Dashboard  : ${CYN}http://localhost:3000${RST}"
+    echo -e "  API docs   : ${CYN}http://localhost:8080/docs${RST}"
+    echo -e "  Platform   : ${YLW}${PLATFORM}${RST}"
     echo ""
-    echo -e "${YLW}First run: the judge model (qwen2.5:7b ~4.7GB) pulls automatically into native Ollama.${RST}"
+    echo -e "${YLW}First run: judge model (qwen2.5:7b ~4.7 GB) pulls automatically.${RST}"
     echo -e "${YLW}Benchmark models pull on first selection — only once each.${RST}"
     ;;
+
   down)
-    echo -e "${YLW}Stopping JudgeGPT…${RST}"
-    docker compose down
+    echo -e "${YLW}Stopping JudgeGPT (${PLATFORM})…${RST}"
+    eval "$COMPOSE down --remove-orphans"
     ;;
+
   logs)
-    docker compose logs -f orchestrator
+    eval "$COMPOSE logs -f orchestrator"
     ;;
+
+  platform)
+    echo "$PLATFORM"
+    ;;
+
   *)
-    echo "Usage: ./start.sh [up|down|logs]"
+    echo -e "Usage: ./start.sh ${CYN}[up|down|logs|platform]${RST} ${YLW}[--platform mac|nvidia|amd|cpu]${RST}"
+    echo ""
+    echo -e "Detected platform: ${YLW}$(detect_platform)${RST}"
+    echo ""
+    echo "Platform overrides:"
+    echo "  ./start.sh up --platform mac     macOS Apple Silicon (native Ollama / Metal)"
+    echo "  ./start.sh up --platform nvidia  NVIDIA GPU (Linux / Windows WSL2)"
+    echo "  ./start.sh up --platform amd     AMD ROCm (Linux)"
+    echo "  ./start.sh up --platform cpu     CPU only (any machine)"
     ;;
 esac

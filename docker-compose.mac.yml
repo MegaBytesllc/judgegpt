@@ -1,0 +1,13 @@
+# JudgeGPT — macOS Apple Silicon overlay
+#
+# Inference runs on the Mac host via native Ollama (Metal GPU).
+# Start native Ollama first (start.sh handles this automatically):
+#   OLLAMA_HOST=0.0.0.0:11435 OLLAMA_NUM_PARALLEL=4 \
+#   OLLAMA_MAX_LOADED_MODELS=4 OLLAMA_FLASH_ATTENTION=1 ollama serve
+#
+# No Ollama Docker container needed — host.docker.internal bridges to it.
+
+services:
+  orchestrator:
+    environment:
+      - NATIVE_OLLAMA_HOST=http://host.docker.internal:11435
