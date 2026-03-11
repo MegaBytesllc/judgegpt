@@ -112,7 +112,7 @@ case "$CMD" in
         else
           echo -e "${GRN}✓ AMD ROCm devices found${RST}"
         fi
-        if [[ -n "$HSA_OVERRIDE_GFX_VERSION" ]]; then
+        if [[ -n "${HSA_OVERRIDE_GFX_VERSION:-}" ]]; then
           echo -e "   Override: ${YLW}HSA_OVERRIDE_GFX_VERSION=${HSA_OVERRIDE_GFX_VERSION}${RST}"
         fi
       fi
