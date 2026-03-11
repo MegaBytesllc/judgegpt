@@ -103,7 +103,18 @@ case "$CMD" in
         echo -e "   Install guide: ${CYN}https://rocm.docs.amd.com/en/latest/deploy/linux/installer/install.html${RST}"
         echo ""
       else
-        echo -e "${GRN}✓ AMD ROCm devices found${RST}"
+        # Show GPU name from rocminfo if available
+        GPU_NAME=$(rocminfo 2>/dev/null | grep -m1 "Marketing Name" | sed 's/.*Marketing Name: *//' || echo "")
+        GFX_TARGET=$(rocminfo 2>/dev/null | grep -m1 "gfx" | grep -o 'gfx[0-9]*' | head -1 || echo "")
+        if [[ -n "$GPU_NAME" ]]; then
+          echo -e "${GRN}✓ AMD GPU: ${GPU_NAME}${RST}"
+          [[ -n "$GFX_TARGET" ]] && echo -e "   Target: ${CYN}${GFX_TARGET}${RST}"
+        else
+          echo -e "${GRN}✓ AMD ROCm devices found${RST}"
+        fi
+        if [[ -n "$HSA_OVERRIDE_GFX_VERSION" ]]; then
+          echo -e "   Override: ${YLW}HSA_OVERRIDE_GFX_VERSION=${HSA_OVERRIDE_GFX_VERSION}${RST}"
+        fi
       fi
 
     # ── CPU fallback ────────────────────────────────────────────────────────
@@ -133,12 +144,38 @@ case "$CMD" in
     eval "$COMPOSE logs -f orchestrator"
     ;;
 
+  gpu-info)
+    # Detect AMD GPU details from inside an ROCm container — useful for troubleshooting
+    echo -e "${PRP}⚖  JudgeGPT — AMD GPU detection${RST}"
+    echo ""
+    if [[ ! -e /dev/kfd ]]; then
+      echo -e "${RED}✗ /dev/kfd not found — ROCm drivers not installed.${RST}"
+      exit 1
+    fi
+    echo -e "${YLW}Running rocminfo inside ollama/ollama:rocm…${RST}"
+    echo ""
+    $DOCKER run --rm \
+      --device=/dev/kfd:/dev/kfd \
+      --device=/dev/dri:/dev/dri \
+      --group-add video \
+      --group-add render \
+      ollama/ollama:rocm \
+      sh -c "rocminfo 2>/dev/null | grep -E '(Name|gfx[0-9]|Architecture|Compute Unit|Max Clock)' | head -30" \
+      || echo -e "${RED}rocminfo failed — ROCm may not recognise this GPU.${RST}"
+    echo ""
+    echo -e "${YLW}If your GPU appears above but Ollama still uses CPU, set:${RST}"
+    echo -e "   ${CYN}RDNA 2 (RX 6000):  export HSA_OVERRIDE_GFX_VERSION=10.3.0${RST}"
+    echo -e "   ${CYN}RDNA 3 (RX 7000):  export HSA_OVERRIDE_GFX_VERSION=11.0.0${RST}"
+    echo -e "   ${CYN}RDNA 4 (RX 9000):  export HSA_OVERRIDE_GFX_VERSION=12.0.1${RST}"
+    echo -e "   …then re-run:  ${YLW}./start.sh up${RST}"
+    ;;
+
   platform)
     echo "$PLATFORM"
     ;;
 
   *)
-    echo -e "Usage: ./start.sh ${CYN}[up|down|logs|platform]${RST} ${YLW}[--platform mac|nvidia|amd|cpu]${RST}"
+    echo -e "Usage: ./start.sh ${CYN}[up|down|logs|platform|gpu-info]${RST} ${YLW}[--platform mac|nvidia|amd|cpu]${RST}"
     echo ""
     echo -e "Detected platform: ${YLW}$(detect_platform)${RST}"
     echo ""
@@ -147,5 +184,8 @@ case "$CMD" in
     echo "  ./start.sh up --platform nvidia  NVIDIA GPU (Linux / Windows WSL2)"
     echo "  ./start.sh up --platform amd     AMD ROCm (Linux)"
     echo "  ./start.sh up --platform cpu     CPU only (any machine)"
+    echo ""
+    echo "AMD diagnostics:"
+    echo "  ./start.sh gpu-info              Detect AMD GPU + gfx target inside ROCm container"
     ;;
 esac

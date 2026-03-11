@@ -2,11 +2,21 @@
 #
 # Requirements:
 #   - ROCm drivers installed: https://rocm.docs.amd.com/en/latest/
-#   - Supported GPU: RX 5000+, RX 6000+, RX 7000+, Instinct MI series
+#   - Supported GPU: RX 5000+, RX 6000+, RX 7000+, RX 9000+, Instinct MI series
 #   - User in 'video' and 'render' groups:
-#     sudo usermod -aG video,render $USER
+#     sudo usermod -aG video,render $USER && newgrp video
 #
-# Works on: Linux with AMD GPU + ROCm
+# Troubleshoot:
+#   ./start.sh gpu-info   ← shows detected GPU + gfx target
+#
+# If Ollama still falls back to CPU, override the gfx version by setting
+# HSA_OVERRIDE_GFX_VERSION in your shell before running ./start.sh up:
+#
+#   RDNA 2 (RX 6000):   export HSA_OVERRIDE_GFX_VERSION=10.3.0
+#   RDNA 3 (RX 7000):   export HSA_OVERRIDE_GFX_VERSION=11.0.0
+#   RDNA 4 (RX 9000):   export HSA_OVERRIDE_GFX_VERSION=12.0.1
+#
+# Works on: Linux with AMD GPU + ROCm drivers
 
 services:
   ollama:
@@ -21,7 +31,11 @@ services:
       - OLLAMA_NUM_PARALLEL=4
       - OLLAMA_MAX_LOADED_MODELS=4
       - OLLAMA_FLASH_ATTENTION=1
-      - HSA_OVERRIDE_GFX_VERSION=11.0.0   # adjust for your GPU arch if needed
+      - OLLAMA_GPU_OVERHEAD=0
+      # Let ROCm auto-detect your GPU target.
+      # Only set this if ./start.sh gpu-info shows your GPU as unsupported
+      # and Ollama falls back to CPU.  Value examples: 11.0.0, 12.0.1
+      - HSA_OVERRIDE_GFX_VERSION=${HSA_OVERRIDE_GFX_VERSION:-}
     devices:
       - /dev/kfd:/dev/kfd
       - /dev/dri:/dev/dri
