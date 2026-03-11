@@ -712,7 +712,7 @@ def export_csv():
 @app.get("/metrics")
 def metrics():
     from fastapi.responses import PlainTextResponse
-    lines = ["# LLMbench metrics"]
+    lines = ["# JudgeGPT metrics"]
     for name, r in _benchmark_results.items():
         lines.append(f'judgegpt_tps{{model="{name}"}} {r["tps_mean"]}')
         lines.append(f'judgegpt_ttft_ms{{model="{name}"}} {r["ttft_mean"]}')
