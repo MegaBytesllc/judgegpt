@@ -1,0 +1,58 @@
+version: "3.9"
+
+# JudgeGPT — Production App
+# M1 Mac: run with `docker compose up --build`
+#
+# Judge and benchmark models both run on the native Ollama instance (Metal GPU).
+# Start native Ollama before docker compose up:
+#   OLLAMA_HOST=0.0.0.0:11435 OLLAMA_NUM_PARALLEL=4 OLLAMA_MAX_LOADED_MODELS=4 \
+#   OLLAMA_FLASH_ATTENTION=1 ollama serve
+#
+# Model containers are NOT defined here — the orchestrator spawns
+# them dynamically via the Docker SDK when a benchmark starts.
+
+services:
+
+  # ── Orchestrator ──────────────────────────────────────────────────────────
+  orchestrator:
+    build:
+      context: ./orchestrator
+      dockerfile: Dockerfile
+    container_name: judgegpt-orchestrator
+    ports:
+      - "8080:8080"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock  # Docker-in-Docker for spawning
+      - ~/.ollama:/root/.ollama                     # model cache reference
+      - ./orchestrator/main.py:/app/main.py         # live-reload code changes
+    environment:
+      - OLLAMA_MODELS_PATH=${HOME}/.ollama
+      - JUDGE_MODEL=qwen2.5:7b
+      - DOCKER_NETWORK=judgegpt-net
+      - OLLAMA_BASE_PORT=11501
+      - OLLAMA_IMAGE=ollama/ollama:latest
+      # Native Ollama on the Mac host (Metal GPU) — used for both benchmark
+      # models and the judge. Port 11435 to avoid conflicts.
+      - NATIVE_OLLAMA_HOST=http://host.docker.internal:11435
+    networks:
+      - judgegpt-net
+    restart: unless-stopped
+
+  # ── Frontend ──────────────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: judgegpt-frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      - orchestrator
+    networks:
+      - judgegpt-net
+    restart: unless-stopped
+
+networks:
+  judgegpt-net:
+    name: judgegpt-net
+    driver: bridge

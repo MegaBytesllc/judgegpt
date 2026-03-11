@@ -1,0 +1,18 @@
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#080c10;--surface:#0d1117;--surface2:#161b22;
+  --border:#21262d;--border2:#30363d;
+  --text:#e6edf3;--muted:#7d8590;
+  --cyan:#00e5ff;--purple:#b388ff;--green:#69ff47;
+  --yellow:#ffd740;--orange:#ff6e40;--pink:#ff4081;
+  --mono:'Space Mono',monospace;--sans:'Inter',system-ui,sans-serif;
+}
+html{font-size:14px}
+body{background:var(--bg);color:var(--text);font-family:var(--sans);line-height:1.6;-webkit-font-smoothing:antialiased}
+::-webkit-scrollbar{width:6px;height:6px}
+::-webkit-scrollbar-track{background:var(--surface)}
+::-webkit-scrollbar-thumb{background:var(--border2);border-radius:3px}
+button{cursor:pointer;font-family:inherit}
+@keyframes spin{to{transform:rotate(360deg)}}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.4}}
+@keyframes slideIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
