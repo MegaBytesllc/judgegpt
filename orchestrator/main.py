@@ -71,6 +71,7 @@ _benchmark_results: dict[str, dict] = {}
 _judge_scores: dict[str, dict] = {}
 _human_scores: dict[str, float] = {}
 _run_events: list[dict] = []
+_benchmark_history: list[dict] = []   # capped at 100 entries, newest at end
 
 # ── Mutable judge config ────────────────────────────────────────────────────────
 # Default system prompt — overridable at runtime via POST /judge/config
@@ -315,7 +316,13 @@ async def run_single(
             timeout=aiohttp.ClientTimeout(total=300),
         ) as resp:
             if resp.status != 200:
-                raise RuntimeError(f"Ollama returned {resp.status}")
+                body = await resp.text()
+                # Try to extract the Ollama error message from JSON
+                try:
+                    detail = json.loads(body).get("error", body[:200])
+                except Exception:
+                    detail = body[:200]
+                raise RuntimeError(f"Ollama returned {resp.status}: {detail}")
             async for line in resp.content:
                 line = line.strip()
                 if not line:
@@ -379,15 +386,24 @@ async def benchmark_model(
     runs = []
     for i in range(n_runs):
         await event_queue.put({"event": "run_start", "model": model_name, "run": i + 1, "total": n_runs})
-        try:
-            run = await run_single(model_name, container_info, prompt, n_tokens)
-            run["run"] = i + 1
-            runs.append(run)
-            await event_queue.put({"event": "run_done", "model": model_name, "run": i + 1,
-                                   "tps": run["tps"], "ttft_ms": run["ttft_ms"]})
-        except Exception as e:
-            log.error(f"Run {i+1} failed for {model_name}: {e}")
-            await event_queue.put({"event": "run_error", "model": model_name, "run": i + 1, "error": str(e)})
+        last_err: Exception | None = None
+        for attempt in range(2):  # 1 retry on transient errors
+            try:
+                run = await run_single(model_name, container_info, prompt, n_tokens)
+                run["run"] = i + 1
+                runs.append(run)
+                await event_queue.put({"event": "run_done", "model": model_name, "run": i + 1,
+                                       "tps": run["tps"], "ttft_ms": run["ttft_ms"]})
+                last_err = None
+                break
+            except Exception as e:
+                last_err = e
+                log.warning(f"Run {i+1} attempt {attempt+1} failed for {model_name}: {e}")
+                if attempt == 0:
+                    await asyncio.sleep(2)  # brief pause before retry
+        if last_err is not None:
+            log.error(f"Run {i+1} failed for {model_name} after retries: {last_err}")
+            await event_queue.put({"event": "run_error", "model": model_name, "run": i + 1, "error": str(last_err)})
 
     if not runs:
         return None
@@ -532,6 +548,9 @@ class HumanScoreRequest(BaseModel):
 class CustomModelRequest(BaseModel):
     model_name: str  # any valid Ollama model tag e.g. "llama3.2:3b"
 
+class PullModelRequest(BaseModel):
+    model_name: str
+
 # ── Routes ─────────────────────────────────────────────────────────────────────
 
 @app.get("/")
@@ -616,6 +635,24 @@ async def run_benchmark_endpoint(req: BenchmarkRequest):
                 asyncio.create_task(kill_container(name))
 
         lb = compute_leaderboard()
+
+        # Persist to history
+        if results:
+            model_names_in_run = [r["model"] for r in results]
+            _benchmark_history.append({
+                "id": str(uuid.uuid4()),
+                "timestamp": time.time(),
+                "prompt": req.prompt,
+                "n_tokens": req.n_tokens,
+                "n_runs": req.n_runs,
+                "models": model_names_in_run,
+                "results": {r["model"]: r for r in results},
+                "judge_scores": {m: s for m, s in _judge_scores.items() if m in model_names_in_run},
+                "leaderboard": lb,
+            })
+            if len(_benchmark_history) > 100:
+                _benchmark_history.pop(0)
+
         yield f"data: {json.dumps({'event': 'done', 'leaderboard': lb})}\n\n"
 
     return StreamingResponse(stream(), media_type="text/event-stream",
@@ -894,3 +931,77 @@ async def proxy_chat(req: ProxyChatRequest):
 
     return StreamingResponse(sse_stream(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+# ── Local model list & pull ─────────────────────────────────────────────────
+
+@app.get("/models/local")
+async def list_local_models():
+    """Return models already downloaded in the Ollama instance."""
+    url = _effective_judge_url()
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"{url}/api/tags",
+                                   timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                data = await resp.json()
+                return data.get("models", [])
+    except Exception:
+        return []
+
+
+@app.post("/models/pull")
+async def pull_model_endpoint(req: PullModelRequest):
+    """Pull a model from the Ollama registry, streaming progress as SSE.
+
+    Each SSE event mirrors the Ollama /api/pull chunk:
+      { "status": "pulling layer", "total": N, "completed": N }
+    Final success event: { "status": "success" }
+    """
+    url = _effective_judge_url()
+    log.info(f"Pulling model {req.model_name} from {url}")
+
+    async def sse_stream() -> AsyncGenerator[str, None]:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{url}/api/pull",
+                    json={"name": req.model_name, "stream": True},
+                    timeout=aiohttp.ClientTimeout(total=3600),
+                ) as resp:
+                    if resp.status != 200:
+                        body = await resp.text()
+                        try:
+                            detail = json.loads(body).get("error", body[:200])
+                        except Exception:
+                            detail = body[:200]
+                        yield f"data: {json.dumps({'status':'error','error':detail})}\n\n"
+                        return
+                    async for raw in resp.content:
+                        raw = raw.strip()
+                        if not raw:
+                            continue
+                        try:
+                            chunk = json.loads(raw)
+                            yield f"data: {json.dumps(chunk)}\n\n"
+                            if chunk.get("status") == "success":
+                                break
+                        except json.JSONDecodeError:
+                            continue
+        except Exception as e:
+            yield f"data: {json.dumps({'status':'error','error':str(e)})}\n\n"
+
+    return StreamingResponse(sse_stream(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+# ── Benchmark history ───────────────────────────────────────────────────────
+
+@app.get("/history")
+def get_history():
+    """Return benchmark history (newest first)."""
+    return list(reversed(_benchmark_history))
+
+@app.delete("/history")
+def clear_history():
+    _benchmark_history.clear()
+    return {"cleared": True}

@@ -118,6 +118,7 @@ const TABS = [
   { id:'overall',    label:'🏆 Overall' },
   { id:'stream',     label:'💬 Stream' },
   { id:'playground', label:'🔌 Playground' },
+  { id:'history',    label:'📚 History' },
 ]
 
 const DEFAULT_PANEL = (idx) => ({
@@ -166,6 +167,16 @@ export default function App() {
   const streamPanelRefs = useRef({})
   const streamAbortRef  = useRef(null)
 
+  // ── Model pull state ────────────────────────────────────────────────────────
+  const [localModels, setLocalModels]     = useState([])         // [{name, size, ...}]
+  const [pullStatus, setPullStatus]       = useState({})         // model → 'pulling'|'done'|'error'
+  const [pullProgress, setPullProgress]   = useState({})         // model → 0-100
+  const [pullMsg, setPullMsg]             = useState({})         // model → last status string
+
+  // ── History state ───────────────────────────────────────────────────────────
+  const [history, setHistory]             = useState([])
+  const [historyLoading, setHistoryLoading] = useState(false)
+
   // ── Playground tab state ───────────────────────────────────────────────────
   const [playPanels, setPlayPanels]   = useState([DEFAULT_PANEL(0), DEFAULT_PANEL(1)])
   const [playPrompt, setPlayPrompt]   = useState('')
@@ -183,6 +194,13 @@ export default function App() {
     setLog(prev => [...prev.slice(-80), { ts, msg, type }])
   }, [])
 
+  const fetchLocalModels = useCallback(() => {
+    fetch(`${API}/models/local`)
+      .then(r => r.json())
+      .then(data => setLocalModels(Array.isArray(data) ? data : []))
+      .catch(() => {})
+  }, [])
+
   useEffect(() => {
     fetch(`${API}/models/catalog`)
       .then(r => r.json())
@@ -196,7 +214,21 @@ export default function App() {
       .then(r => r.json())
       .then(data => { setJudgeSystemPrompt(data.system_prompt); setJudgeModel(data.model) })
       .catch(() => {})
+    fetchLocalModels()
   }, [])
+
+  // Refresh local model list when switching to History tab, and fetch history
+  useEffect(() => {
+    if (tab === 'run') fetchLocalModels()
+    if (tab === 'history') {
+      setHistoryLoading(true)
+      fetch(`${API}/history`)
+        .then(r => r.json())
+        .then(data => setHistory(Array.isArray(data) ? data : []))
+        .catch(() => setHistory([]))
+        .finally(() => setHistoryLoading(false))
+    }
+  }, [tab])
 
   const saveJudgeConfig = (prompt, model) => {
     clearTimeout(judgeConfigSaveTimer.current)
@@ -226,6 +258,68 @@ export default function App() {
   }, [playTexts])
 
   const allModels = [...catalog, ...customModels.map(n => ({ name:n, color:'#aaaaaa', custom:true }))]
+
+  // ── Model pull ─────────────────────────────────────────────────────────────
+  const pullModel = async (modelName) => {
+    setPullStatus(p => ({ ...p, [modelName]: 'pulling' }))
+    setPullProgress(p => ({ ...p, [modelName]: 0 }))
+    setPullMsg(p => ({ ...p, [modelName]: 'connecting…' }))
+    addLog(`↓ Pulling ${modelName}…`, 'cyan')
+    try {
+      const res = await fetch(`${API}/models/pull`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model_name: modelName }),
+      })
+      const reader = res.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+        const lines = buffer.split('\n')
+        buffer = lines.pop()
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue
+          try {
+            const chunk = JSON.parse(line.slice(6))
+            if (chunk.status === 'error') {
+              setPullStatus(p => ({ ...p, [modelName]: 'error' }))
+              setPullMsg(p => ({ ...p, [modelName]: chunk.error || 'Pull failed' }))
+              addLog(`  ✗ Pull failed: ${chunk.error}`, 'error')
+              return
+            }
+            setPullMsg(p => ({ ...p, [modelName]: chunk.status || '' }))
+            if (chunk.total && chunk.completed != null) {
+              setPullProgress(p => ({ ...p, [modelName]: Math.round((chunk.completed / chunk.total) * 100) }))
+            }
+            if (chunk.status === 'success') {
+              setPullStatus(p => ({ ...p, [modelName]: 'done' }))
+              setPullProgress(p => ({ ...p, [modelName]: 100 }))
+              addLog(`  ✓ ${modelName} ready`, 'green')
+              fetchLocalModels()
+              return
+            }
+          } catch {}
+        }
+      }
+    } catch (e) {
+      setPullStatus(p => ({ ...p, [modelName]: 'error' }))
+      setPullMsg(p => ({ ...p, [modelName]: e.message }))
+      addLog(`  ✗ Pull error: ${e.message}`, 'error')
+    }
+  }
+
+  // ── History restore ────────────────────────────────────────────────────────
+  const restoreHistory = (entry) => {
+    setResults(entry.results || {})
+    setJudgeScores(entry.judge_scores || {})
+    setLeaderboard(entry.leaderboard || [])
+    setSelected(entry.models || [])
+    addLog(`📚 Restored run from ${new Date(entry.timestamp * 1000).toLocaleString()}`, 'cyan')
+    setTab('metrics')
+  }
 
   const addCustomModel = () => {
     const name = customModel.trim()
@@ -539,9 +633,15 @@ export default function App() {
               <div style={{ fontSize:10, color:'var(--muted)', textTransform:'uppercase', letterSpacing:1, marginBottom:12 }}>Select Models</div>
               <div style={{ display:'grid', gridTemplateColumns:'repeat(auto-fill,minmax(210px,1fr))', gap:8 }}>
                 {allModels.map(m => {
-                  const on = selected.includes(m.name)
-                  const col = m.color || '#888'
-                  const phase = containerStatus[m.name]
+                  const on       = selected.includes(m.name)
+                  const col      = m.color || '#888'
+                  const phase    = containerStatus[m.name]
+                  const base     = m.name.split(':')[0]
+                  const isLocal  = localModels.some(lm => lm.name === m.name || lm.name.startsWith(base + ':'))
+                  const pulling  = pullStatus[m.name] === 'pulling'
+                  const pullDone = pullStatus[m.name] === 'done'
+                  const pullErr  = pullStatus[m.name] === 'error'
+                  const pct      = pullProgress[m.name] ?? 0
                   return (
                     <button key={m.name} onClick={() => setSelected(p =>
                       p.includes(m.name) ? p.filter(x=>x!==m.name) : [...p,m.name]
@@ -550,20 +650,54 @@ export default function App() {
                       border:`1px solid ${on ? col : 'var(--border)'}`,
                       borderRadius:6, padding:'8px 12px', textAlign:'left',
                       color: on ? col : 'var(--muted)', transition:'all 0.15s',
-                      display:'flex', alignItems:'center', justifyContent:'space-between',
+                      display:'flex', flexDirection:'column', gap:0,
                     }}>
-                      <div>
-                        <div style={{ fontFamily:'var(--mono)', fontSize:11 }}>{m.name}</div>
-                        {m.size_gb && <div style={{ fontSize:10, color:'var(--muted)', marginTop:2 }}>{m.size_gb}GB</div>}
-                        {m.custom && <div style={{ fontSize:10, color:'var(--yellow)', marginTop:2 }}>custom</div>}
+                      <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between' }}>
+                        <div>
+                          <div style={{ fontFamily:'var(--mono)', fontSize:11 }}>{m.name}</div>
+                          {m.size_gb && <div style={{ fontSize:10, color:'var(--muted)', marginTop:2 }}>{m.size_gb} GB</div>}
+                          {m.custom && <div style={{ fontSize:10, color:'var(--yellow)', marginTop:2 }}>custom</div>}
+                        </div>
+                        <div style={{ display:'flex', alignItems:'center', gap:6 }}>
+                          {phase && <Dot color={statusColor[phase]||'var(--muted)'} pulse={phase==='spawning'} />}
+                          <div style={{ width:14, height:14, borderRadius:'50%',
+                            background: on ? col : 'var(--border)',
+                            border:`2px solid ${on ? col : 'var(--border2)'}`,
+                            boxShadow: on ? `0 0 8px ${col}` : 'none', transition:'all 0.15s' }} />
+                        </div>
                       </div>
-                      <div style={{ display:'flex', alignItems:'center', gap:6 }}>
-                        {phase && <Dot color={statusColor[phase]||'var(--muted)'} pulse={phase==='spawning'} />}
-                        <div style={{ width:14, height:14, borderRadius:'50%',
-                          background: on ? col : 'var(--border)',
-                          border:`2px solid ${on ? col : 'var(--border2)'}`,
-                          boxShadow: on ? `0 0 8px ${col}` : 'none', transition:'all 0.15s' }} />
-                      </div>
+
+                      {/* Pull status row */}
+                      {pulling ? (
+                        <div style={{ marginTop:6 }}>
+                          <div style={{ height:2, background:'var(--border)', borderRadius:1, overflow:'hidden' }}>
+                            <div style={{ width:`${pct}%`, height:'100%', background:col, transition:'width 0.4s' }} />
+                          </div>
+                          <div style={{ fontSize:9, color:'var(--muted)', marginTop:3, fontFamily:'var(--mono)',
+                            display:'flex', justifyContent:'space-between' }}>
+                            <span style={{ overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap', maxWidth:120 }}>
+                              {pullMsg[m.name] || 'pulling…'}
+                            </span>
+                            <span>{pct}%</span>
+                          </div>
+                        </div>
+                      ) : isLocal || pullDone ? (
+                        <div style={{ fontSize:9, color:'var(--green)', marginTop:5, fontFamily:'var(--mono)' }}>✓ ready</div>
+                      ) : pullErr ? (
+                        <div style={{ fontSize:9, color:'var(--orange)', marginTop:5, fontFamily:'var(--mono)',
+                          display:'flex', justifyContent:'space-between', alignItems:'center' }}>
+                          <span>pull failed</span>
+                          <span onClick={e => { e.stopPropagation(); pullModel(m.name) }}
+                            style={{ cursor:'pointer', color:'var(--cyan)', textDecoration:'underline' }}>retry</span>
+                        </div>
+                      ) : (
+                        <button onClick={e => { e.stopPropagation(); pullModel(m.name) }} style={{
+                          marginTop:5, fontSize:9, color:'var(--cyan)',
+                          background:'transparent', border:'1px solid var(--cyan)44',
+                          borderRadius:3, padding:'2px 7px', fontFamily:'var(--mono)',
+                          cursor:'pointer', alignSelf:'flex-start',
+                        }}>↓ pull</button>
+                      )}
                     </button>
                   )
                 })}
@@ -1249,6 +1383,99 @@ export default function App() {
                 </button>
               </div>
             </div>
+          </div>
+        )}
+
+        {/* ── HISTORY ── */}
+        {tab === 'history' && (
+          <div style={{ display:'flex', flexDirection:'column', gap:14, maxWidth:900, margin:'0 auto' }}>
+            <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between' }}>
+              <SectionHeader>Benchmark History</SectionHeader>
+              {history.length > 0 && (
+                <button onClick={() => {
+                  fetch(`${API}/history`, { method:'DELETE' }).then(() => setHistory([]))
+                }} style={{
+                  fontSize:10, color:'var(--orange)', background:'transparent',
+                  border:'1px solid var(--orange)44', borderRadius:4,
+                  padding:'3px 10px', fontFamily:'var(--mono)', cursor:'pointer',
+                }}>✕ clear all</button>
+              )}
+            </div>
+
+            {historyLoading ? (
+              <div style={{ display:'flex', justifyContent:'center', marginTop:60 }}>
+                <Spinner size={20} />
+              </div>
+            ) : history.length === 0 ? (
+              <div style={{ color:'var(--muted)', textAlign:'center', marginTop:80, fontFamily:'var(--mono)' }}>
+                No history yet — completed benchmarks appear here automatically.
+              </div>
+            ) : history.map((entry) => {
+              const date     = new Date(entry.timestamp * 1000)
+              const topModel = entry.leaderboard?.[0]
+              const topCol   = entry.results?.[topModel?.model]?.color || 'var(--cyan)'
+              const hasJudge = Object.keys(entry.judge_scores || {}).length > 0
+              return (
+                <div key={entry.id} style={{ background:'var(--surface)',
+                  border:'1px solid var(--border)', borderRadius:8, padding:16,
+                  animation:'slideIn 0.2s ease' }}>
+
+                  {/* Header row */}
+                  <div style={{ display:'flex', alignItems:'flex-start', justifyContent:'space-between', gap:12, marginBottom:10 }}>
+                    <div style={{ flex:1, minWidth:0 }}>
+                      <div style={{ fontFamily:'var(--mono)', fontSize:10, color:'var(--muted)', marginBottom:4 }}>
+                        {date.toLocaleString()} · {entry.models?.length} model{entry.models?.length !== 1 ? 's' : ''} · {entry.n_runs} run{entry.n_runs !== 1 ? 's' : ''} · {entry.n_tokens} tok
+                      </div>
+                      <div style={{ fontSize:12, color:'var(--text)', fontStyle:'italic',
+                        overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>
+                        "{entry.prompt}"
+                      </div>
+                    </div>
+                    <button onClick={() => restoreHistory(entry)} style={{
+                      flexShrink:0, background:'var(--cyan)18', border:'1px solid var(--cyan)',
+                      color:'var(--cyan)', padding:'6px 14px', borderRadius:5,
+                      fontFamily:'var(--mono)', fontSize:11, cursor:'pointer',
+                    }}>↺ restore</button>
+                  </div>
+
+                  {/* Model tags */}
+                  <div style={{ display:'flex', gap:6, flexWrap:'wrap', marginBottom:10 }}>
+                    {(entry.models || []).map(m => {
+                      const col = entry.results?.[m]?.color || '#888'
+                      const tps = entry.results?.[m]?.tps_mean
+                      return (
+                        <span key={m} style={{ fontFamily:'var(--mono)', fontSize:10,
+                          color:col, background:col+'18', border:`1px solid ${col}44`,
+                          borderRadius:3, padding:'2px 8px', display:'flex', alignItems:'center', gap:5 }}>
+                          {m}
+                          {tps != null && <span style={{ color:'var(--muted)' }}>{tps}t/s</span>}
+                        </span>
+                      )
+                    })}
+                  </div>
+
+                  {/* Winner + scores */}
+                  {topModel && (
+                    <div style={{ display:'flex', alignItems:'center', gap:14,
+                      background:'var(--surface2)', borderRadius:6, padding:'8px 12px' }}>
+                      <span style={{ fontSize:14 }}>🏆</span>
+                      <span style={{ fontFamily:'var(--mono)', fontSize:11, color:topCol }}>{topModel.model}</span>
+                      <div style={{ display:'flex', gap:8, marginLeft:'auto' }}>
+                        <Tag color="var(--cyan)">{topModel.tps_mean} t/s</Tag>
+                        <Tag color="var(--yellow)">{topModel.ttft_mean}ms</Tag>
+                        {topModel.combined_score != null && (
+                          <Tag color="var(--purple)">{topModel.combined_score.toFixed(1)}/100</Tag>
+                        )}
+                        {!hasJudge && (
+                          <span style={{ fontSize:10, color:'var(--muted)', fontFamily:'var(--mono)',
+                            alignSelf:'center' }}>no judge score</span>
+                        )}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )
+            })}
           </div>
         )}
 

@@ -30,10 +30,10 @@ services:
       - OLLAMA_MAX_LOADED_MODELS=4
       - OLLAMA_FLASH_ATTENTION=1
       - OLLAMA_GPU_OVERHEAD=0
-      # Let ROCm auto-detect your GPU target.
-      # Only set this if ./start.sh gpu-info shows your GPU as unsupported
-      # and Ollama falls back to CPU.  Value examples: 11.0.0, 12.0.1
-      - HSA_OVERRIDE_GFX_VERSION=${HSA_OVERRIDE_GFX_VERSION:-}
+      # gfx1201 = RDNA 4 (RX 9070 / RX 9070 XT).  ROCm requires this override
+      # because the ollama:rocm image doesn't auto-recognise gfx1201 yet.
+      # Shell override still wins: export HSA_OVERRIDE_GFX_VERSION=x.y.z
+      - HSA_OVERRIDE_GFX_VERSION=${HSA_OVERRIDE_GFX_VERSION:-12.0.1}
     devices:
       - /dev/kfd:/dev/kfd
       - /dev/dri:/dev/dri
