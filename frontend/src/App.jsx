@@ -142,7 +142,7 @@ export default function App() {
   const [customModels, setCustomModels] = useState([])
   const [prompt, setPrompt] = useState("Explain Einstein's theory of relativity in simple terms.")
   const [nRuns, setNRuns] = useState(3)
-  const [nTokens, setNTokens] = useState(256)
+  const [nTokens, setNTokens] = useState(512)
   const [autoJudge, setAutoJudge] = useState(true)
   const [keepAlive, setKeepAlive] = useState(false)
   const [judgeSystemPrompt, setJudgeSystemPrompt] = useState('')
@@ -740,15 +740,18 @@ export default function App() {
                 </div>
               </div>
               <div style={{ background:'var(--surface)', border:'1px solid var(--border)', borderRadius:8, padding:14 }}>
-                <div style={{ fontSize:10, color:'var(--muted)', marginBottom:8 }}>MAX TOKENS</div>
-                <div style={{ display:'flex', gap:6 }}>
-                  {[128,256,512].map(n => (
+                <div style={{ fontSize:10, color:'var(--muted)', marginBottom:8 }}>
+                  MAX TOKENS {nTokens === -1 ? '— unlimited' : ''}
+                </div>
+                <div style={{ display:'flex', gap:6, flexWrap:'wrap' }}>
+                  {[256,512,1024,2048,4096,-1].map(n => (
                     <button key={n} onClick={() => setNTokens(n)} style={{
                       background: nTokens===n ? 'var(--purple)22' : 'var(--surface2)',
                       border:`1px solid ${nTokens===n ? 'var(--purple)' : 'var(--border)'}`,
                       color: nTokens===n ? 'var(--purple)' : 'var(--muted)',
                       padding:'4px 10px', borderRadius:4, fontFamily:'var(--mono)', fontSize:11,
-                    }}>{n}</button>
+                      cursor:'pointer',
+                    }}>{n === -1 ? '∞' : n}</button>
                   ))}
                 </div>
               </div>
@@ -1424,7 +1427,7 @@ export default function App() {
                   <div style={{ display:'flex', alignItems:'flex-start', justifyContent:'space-between', gap:12, marginBottom:10 }}>
                     <div style={{ flex:1, minWidth:0 }}>
                       <div style={{ fontFamily:'var(--mono)', fontSize:10, color:'var(--muted)', marginBottom:4 }}>
-                        {date.toLocaleString()} · {entry.models?.length} model{entry.models?.length !== 1 ? 's' : ''} · {entry.n_runs} run{entry.n_runs !== 1 ? 's' : ''} · {entry.n_tokens} tok
+                        {date.toLocaleString()} · {entry.models?.length} model{entry.models?.length !== 1 ? 's' : ''} · {entry.n_runs} run{entry.n_runs !== 1 ? 's' : ''} · {entry.n_tokens === -1 ? '∞' : entry.n_tokens} tok
                       </div>
                       <div style={{ fontSize:12, color:'var(--text)', fontStyle:'italic',
                         overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>

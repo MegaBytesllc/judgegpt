@@ -450,7 +450,7 @@ async def judge_response(model_name: str, question: str, response: str) -> dict:
                 ],
                 "stream": False,
                 "format": "json",
-                "options": {"temperature": 0.1, "num_predict": 400},
+                "options": {"temperature": 0.1, "num_predict": 2048},
             },
             timeout=aiohttp.ClientTimeout(total=120),
         ) as resp:
@@ -536,7 +536,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 class BenchmarkRequest(BaseModel):
     model_names: list[str]
     prompt: str = "Explain Einstein's theory of relativity in simple terms."
-    n_tokens: int = Field(default=256, ge=32, le=2048)
+    n_tokens: int = Field(default=512, ge=-1)  # -1 = unlimited (Ollama num_predict: -1)
     n_runs: int = Field(default=3, ge=1, le=10)
     auto_judge: bool = True
     keep_alive: bool = False  # if False, kill containers after benchmark
@@ -763,7 +763,7 @@ def metrics():
 class StreamLiveRequest(BaseModel):
     model_names: list[str]
     prompt: str
-    n_tokens: int = Field(default=256, ge=32, le=2048)
+    n_tokens: int = Field(default=512, ge=-1)  # -1 = unlimited (Ollama num_predict: -1)
     keep_alive: bool = False
 
 
@@ -849,7 +849,7 @@ class ProxyChatRequest(BaseModel):
     messages: list[dict]
     api_key: str = ""
     temperature: float = 0.7
-    max_tokens: int = 512
+    max_tokens: int = 4096
     system_prompt: str = ""
 
 
