@@ -3,8 +3,6 @@
 # Requirements:
 #   - ROCm drivers installed: https://rocm.docs.amd.com/en/latest/
 #   - Supported GPU: RX 5000+, RX 6000+, RX 7000+, RX 9000+, Instinct MI series
-#   - User in 'video' and 'render' groups:
-#     sudo usermod -aG video,render $USER && newgrp video
 #
 # Troubleshoot:
 #   ./start.sh gpu-info   ← shows detected GPU + gfx target
@@ -39,9 +37,9 @@ services:
     devices:
       - /dev/kfd:/dev/kfd
       - /dev/dri:/dev/dri
-    group_add:
-      - video
-      - render
+    # group_add not needed — ollama/ollama:rocm runs as root, which has
+    # full device access regardless of group membership. The device mounts
+    # above are sufficient for ROCm to reach /dev/kfd and /dev/dri.
     networks:
       - judgegpt-net
     restart: unless-stopped
