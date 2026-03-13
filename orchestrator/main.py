@@ -659,7 +659,8 @@ def compute_leaderboard() -> list:
             "quality_score": round(quality, 1) if quality else None,
             "combined_score": combined,
         })
-    entries.sort(key=lambda x: (x["combined_score"] or 0), reverse=True)
+    # Primary: combined_score (null → 0); secondary: tps_score so fastest wins ties
+    entries.sort(key=lambda x: (x["combined_score"] or 0, x["tps_score"] or 0), reverse=True)
     for i, e in enumerate(entries):
         e["rank"] = i + 1
     return entries

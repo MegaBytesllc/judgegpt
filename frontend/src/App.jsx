@@ -1746,7 +1746,13 @@ export default function App() {
               </div>
             ) : history.map((entry) => {
               const date     = new Date(entry.timestamp * 1000)
-              const topModel = entry.leaderboard?.[0]
+              // Re-sort the stored snapshot: combined_score first, TPS as tiebreak
+              // (fixes old entries saved before judge scores were available)
+              const sortedLb = [...(entry.leaderboard || [])].sort((a, b) => {
+                const as = a.combined_score ?? 0, bs = b.combined_score ?? 0
+                return bs !== as ? bs - as : (b.tps_mean || 0) - (a.tps_mean || 0)
+              })
+              const topModel = sortedLb[0]
               const topCol   = entry.results?.[topModel?.model]?.color || 'var(--cyan)'
               const hasJudge = Object.keys(entry.judge_scores || {}).length > 0
               return (
