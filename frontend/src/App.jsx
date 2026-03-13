@@ -145,6 +145,7 @@ export default function App() {
   const [nTokens, setNTokens] = useState(512)
   const [autoJudge, setAutoJudge] = useState(true)
   const [keepAlive, setKeepAlive] = useState(false)
+  const [sequential, setSequential] = useState(false)
   const [judgeSystemPrompt, setJudgeSystemPrompt] = useState('')
   const [judgeModel, setJudgeModel] = useState('qwen2.5:7b')
   const judgeConfigSaveTimer = useRef(null)
@@ -397,14 +398,15 @@ export default function App() {
     setLastRunConfig({ prompt, nTokens, nRuns })
     addLog(`▶ Starting benchmark: ${selected.join(', ')}`, 'cyan')
     addLog(`  Prompt: "${prompt.slice(0,55)}…"`)
-    addLog(`  ${nRuns} runs · ${nTokens} tokens · judge: ${autoJudge}`)
+    addLog(`  ${nRuns} runs · ${nTokens === -1 ? '∞' : nTokens} tokens · judge: ${autoJudge} · ${sequential ? 'sequential' : 'concurrent'}`)
 
     try {
       const res = await fetch(`${API}/benchmark/run`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ model_names:selected, prompt, n_tokens:nTokens,
-                               n_runs:nRuns, auto_judge:autoJudge, keep_alive:keepAlive }),
+                               n_runs:nRuns, auto_judge:autoJudge, keep_alive:keepAlive,
+                               sequential }),
       })
       const reader = res.body.getReader()
       const decoder = new TextDecoder()
@@ -524,7 +526,7 @@ export default function App() {
       const res = await fetch(`${API}/benchmark/stream-live`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model_names:selected, prompt, n_tokens:nTokens, keep_alive:false }),
+        body: JSON.stringify({ model_names:selected, prompt, n_tokens:nTokens, keep_alive:false, sequential }),
         signal: ctrl.signal,
       })
       const reader = res.body.getReader()
@@ -913,9 +915,17 @@ export default function App() {
                 {[
                   { label:'Auto-Judge', val:autoJudge, set:setAutoJudge, col:'var(--purple)' },
                   { label:'Keep Alive', val:keepAlive, set:setKeepAlive, col:'var(--yellow)' },
+                  { label:'Sequential', val:sequential, set:setSequential, col:'var(--orange)' },
                 ].map(({ label, val, set, col }) => (
                   <div key={label} style={{ display:'flex', alignItems:'center', justifyContent:'space-between' }}>
-                    <span style={{ fontSize:10, color:'var(--muted)' }}>{label}</span>
+                    <div>
+                      <span style={{ fontSize:10, color:'var(--muted)' }}>{label}</span>
+                      {label === 'Sequential' && (
+                        <div style={{ fontSize:9, color:'var(--border2)', fontFamily:'var(--mono)', marginTop:1 }}>
+                          one model at a time
+                        </div>
+                      )}
+                    </div>
                     <div onClick={() => set(v => !v)} style={{
                       width:36, height:20, borderRadius:10, cursor:'pointer',
                       background: val ? col : 'var(--border)', position:'relative', transition:'background 0.2s',

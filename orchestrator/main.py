@@ -541,6 +541,7 @@ class BenchmarkRequest(BaseModel):
     n_runs: int = Field(default=3, ge=1, le=10)
     auto_judge: bool = True
     keep_alive: bool = False  # if False, kill containers after benchmark
+    sequential: bool = False  # if True, run one model at a time (saves VRAM)
 
 class HumanScoreRequest(BaseModel):
     model_name: str
@@ -594,14 +595,19 @@ async def run_benchmark_endpoint(req: BenchmarkRequest):
     results = []
 
     async def stream() -> AsyncGenerator[str, None]:
-        # Run all models concurrently
         tasks = [
             benchmark_model(name, req.prompt, req.n_tokens, req.n_runs, queue)
             for name in req.model_names
         ]
 
         async def run_tasks():
-            done = await asyncio.gather(*tasks, return_exceptions=True)
+            if req.sequential:
+                done = []
+                for coro in tasks:
+                    r = await coro
+                    done.append(r)
+            else:
+                done = await asyncio.gather(*tasks, return_exceptions=True)
             await queue.put(None)  # sentinel
             return done
 
@@ -1058,6 +1064,7 @@ class StreamLiveRequest(BaseModel):
     prompt: str
     n_tokens: int = Field(default=512, ge=-1)  # -1 = unlimited (Ollama num_predict: -1)
     keep_alive: bool = False
+    sequential: bool = False  # if True, stream one model at a time
 
 
 @app.post("/benchmark/stream-live")
@@ -1113,7 +1120,11 @@ async def stream_live_endpoint(req: StreamLiveRequest):
 
     async def sse_stream() -> AsyncGenerator[str, None]:
         async def run_all():
-            await asyncio.gather(*[stream_model(n) for n in req.model_names], return_exceptions=True)
+            if req.sequential:
+                for name in req.model_names:
+                    await stream_model(name)
+            else:
+                await asyncio.gather(*[stream_model(n) for n in req.model_names], return_exceptions=True)
             await queue.put(None)
 
         asyncio.create_task(run_all())
