@@ -162,7 +162,8 @@ export default function App() {
   // ── Stream tab state ───────────────────────────────────────────────────────
   const [streamRunning, setStreamRunning] = useState(false)
   const [streamTexts, setStreamTexts]     = useState({})   // model → accumulated text
-  const [streamStats, setStreamStats]     = useState({})   // model → { tps, ttft_ms, tokens }
+  const [streamStats, setStreamStats]     = useState({})   // model → { tps, ttft_ms, tokens, load_duration_ms, prompt_tps, total_duration_ms }
+  const [streamGpuStats, setStreamGpuStats] = useState({}) // model → latest { gpu_util_pct, vram_used_mb, vram_total_mb, gpu_type }
   const [streamStatus, setStreamStatus]   = useState({})   // model → 'spawning'|'streaming'|'done'|'error'
   const [streamErrors, setStreamErrors]   = useState({})   // model → error string
   const streamPanelRefs = useRef({})
@@ -519,6 +520,7 @@ export default function App() {
     setStreamRunning(true)
     setStreamTexts({})
     setStreamStats({})
+    setStreamGpuStats({})
     setStreamErrors({})
     setStreamStatus(Object.fromEntries(selected.map(m => [m, 'spawning'])))
 
@@ -547,8 +549,15 @@ export default function App() {
             } else if (evt.event === 'token') {
               setStreamTexts(p => ({ ...p, [evt.model]: (p[evt.model] || '') + evt.text }))
             } else if (evt.event === 'model_done') {
-              setStreamStats(p => ({ ...p, [evt.model]: { tps:evt.tps, ttft_ms:evt.ttft_ms, tokens:evt.tokens } }))
+              setStreamStats(p => ({ ...p, [evt.model]: {
+                tps: evt.tps, ttft_ms: evt.ttft_ms, tokens: evt.tokens,
+                load_duration_ms: evt.load_duration_ms,
+                total_duration_ms: evt.total_duration_ms,
+                prompt_tps: evt.prompt_tps,
+              }}))
               setStreamStatus(p => ({ ...p, [evt.model]: 'done' }))
+            } else if (evt.event === 'gpu_stats') {
+              setStreamGpuStats(p => ({ ...p, [evt.model]: evt }))
             } else if (evt.event === 'model_error') {
               setStreamErrors(p => ({ ...p, [evt.model]: evt.error || 'Unknown error' }))
               setStreamStatus(p => ({ ...p, [evt.model]: 'error' }))
@@ -1197,6 +1206,58 @@ export default function App() {
                     </div>
                   )}
 
+                  {/* ── GPU Performance ── */}
+                  {resultList.some(r => r.load_ms_mean > 0 || r.vram_used_mb || r.gpu_util_pct_peak != null) && (
+                    <div style={{ background:'var(--surface)', border:'1px solid var(--border)', borderRadius:8, padding:18 }}>
+                      <SectionHeader>GPU &amp; Inference Performance</SectionHeader>
+                      <div style={{ overflowX:'auto' }}>
+                        <table style={{ width:'100%', borderCollapse:'collapse', fontFamily:'var(--mono)', fontSize:11, minWidth:480 }}>
+                          <thead>
+                            <tr style={{ borderBottom:'1px solid var(--border)' }}>
+                              {['Model','Load','Gen TPS','Prompt TPS','VRAM','GPU Util','Backend'].map(h => (
+                                <th key={h} style={{ textAlign: h==='Model' ? 'left' : 'center', padding:'5px 10px', color:'var(--muted)', fontWeight:400, fontSize:10, textTransform:'uppercase', letterSpacing:0.5 }}>{h}</th>
+                              ))}
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {resultList.map((r, i) => (
+                              <tr key={r.model} style={{ background: i%2===0 ? 'transparent' : 'var(--surface2)' }}>
+                                <td style={{ padding:'7px 10px', color:r.color }}>{r.model.replace(/:.*/, '')}</td>
+                                <td style={{ textAlign:'center', padding:'7px 10px', color:'var(--yellow)' }}>
+                                  {r.load_ms_mean > 0 ? `${r.load_ms_mean}ms` : '—'}
+                                </td>
+                                <td style={{ textAlign:'center', padding:'7px 10px', color:'var(--cyan)' }}>
+                                  {r.tps_mean} t/s
+                                </td>
+                                <td style={{ textAlign:'center', padding:'7px 10px', color:'var(--purple)' }}>
+                                  {r.prompt_tps_mean > 0 ? `${r.prompt_tps_mean} t/s` : '—'}
+                                </td>
+                                <td style={{ textAlign:'center', padding:'7px 10px', color:'var(--fg)' }}>
+                                  {r.vram_used_mb != null
+                                    ? `${r.vram_used_mb.toFixed(0)}${r.vram_total_mb ? `/${r.vram_total_mb.toFixed(0)}` : ''} MB`
+                                    : '—'}
+                                </td>
+                                <td style={{ textAlign:'center', padding:'7px 10px' }}>
+                                  {r.gpu_util_pct_peak != null ? (
+                                    <div style={{ display:'flex', alignItems:'center', gap:6, justifyContent:'center' }}>
+                                      <div style={{ width:48, height:5, background:'var(--border)', borderRadius:3, overflow:'hidden' }}>
+                                        <div style={{ width:`${r.gpu_util_pct_peak}%`, height:'100%', background:r.color, borderRadius:3 }} />
+                                      </div>
+                                      <span style={{ color:r.color }}>{r.gpu_util_pct_peak}%</span>
+                                    </div>
+                                  ) : '—'}
+                                </td>
+                                <td style={{ textAlign:'center', padding:'7px 10px', color:'var(--border2)', fontSize:10, textTransform:'uppercase', letterSpacing:1 }}>
+                                  {r.gpu_type || '—'}
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  )}
+
                   {/* ── Export PDF button ── */}
                   <div style={{ display:'flex', justifyContent:'flex-end' }}>
                     <button onClick={exportPDF} style={{
@@ -1400,7 +1461,8 @@ export default function App() {
                 {selected.map(model => {
                   const col  = allModels.find(m => m.name === model)?.color || '#888'
                   const text = streamTexts[model] || ''
-                  const stats  = streamStats[model]
+                  const stats    = streamStats[model]
+                  const gpuStats = streamGpuStats[model]
                   const status = streamStatus[model]
                   const isStreaming = status === 'streaming'
                   const isDone = status === 'done'
@@ -1426,8 +1488,12 @@ export default function App() {
                           {!status && <span style={{ fontSize:11, color:'var(--border2)' }}>○</span>}
                           <span style={{ fontFamily:'var(--mono)', fontSize:12, color:col }}>{model}</span>
                         </div>
-                        <div style={{ display:'flex', alignItems:'center', gap:6 }}>
-                          {stats && <><Tag color="var(--cyan)">{stats.tps} t/s</Tag><Tag color="var(--yellow)">{stats.ttft_ms}ms TTFT</Tag></>}
+                        <div style={{ display:'flex', alignItems:'center', gap:6, flexWrap:'wrap' }}>
+                          {stats && <>
+                            <Tag color="var(--cyan)">{stats.tps} t/s</Tag>
+                            <Tag color="var(--yellow)">{stats.ttft_ms}ms TTFT</Tag>
+                            {stats.load_duration_ms > 0 && <Tag color="var(--muted)">{stats.load_duration_ms}ms load</Tag>}
+                          </>}
                           {isStreaming && !stats && <Spinner size={12} color={col} />}
                           {status === 'spawning' && <span style={{ fontSize:10, color:'var(--yellow)', fontFamily:'var(--mono)' }}>spawning…</span>}
                         </div>
@@ -1456,12 +1522,44 @@ export default function App() {
                         }
                       </div>
 
-                      {/* Token counter */}
+                      {/* Token counter + prompt TPS */}
                       {text && (
                         <div style={{ fontSize:10, color:'var(--muted)', fontFamily:'var(--mono)',
-                          display:'flex', gap:12 }}>
+                          display:'flex', gap:12, flexWrap:'wrap' }}>
                           <span>{text.split(/\s+/).filter(Boolean).length} words</span>
                           {stats && <span>{stats.tokens} tokens</span>}
+                          {stats?.prompt_tps > 0 && <span style={{ color:'var(--purple)' }}>prompt {stats.prompt_tps} t/s</span>}
+                        </div>
+                      )}
+
+                      {/* GPU stats bar */}
+                      {(gpuStats || (stats?.load_duration_ms > 0)) && (
+                        <div style={{
+                          background:'var(--surface2)', borderRadius:5,
+                          padding:'6px 10px', fontSize:10, fontFamily:'var(--mono)',
+                          display:'flex', gap:14, flexWrap:'wrap', alignItems:'center',
+                        }}>
+                          {gpuStats?.gpu_util_pct != null && (
+                            <div style={{ display:'flex', alignItems:'center', gap:6 }}>
+                              <span style={{ color:'var(--muted)' }}>GPU</span>
+                              <div style={{ width:60, height:5, background:'var(--border)', borderRadius:3, overflow:'hidden' }}>
+                                <div style={{ width:`${gpuStats.gpu_util_pct}%`, height:'100%', background:col, borderRadius:3, transition:'width 0.5s' }} />
+                              </div>
+                              <span style={{ color:col }}>{gpuStats.gpu_util_pct}%</span>
+                            </div>
+                          )}
+                          {(gpuStats?.vram_used_mb != null) && (
+                            <span style={{ color:'var(--muted)' }}>
+                              VRAM {gpuStats.vram_used_mb.toFixed(0)}
+                              {gpuStats.vram_total_mb ? `/${gpuStats.vram_total_mb.toFixed(0)}` : ''}
+                              {' '}MB
+                            </span>
+                          )}
+                          {gpuStats?.gpu_type && (
+                            <span style={{ color:'var(--border2)', textTransform:'uppercase', letterSpacing:1 }}>
+                              {gpuStats.gpu_type}
+                            </span>
+                          )}
                         </div>
                       )}
                     </div>

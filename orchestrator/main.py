@@ -15,6 +15,7 @@ import io
 import json
 import logging
 import os
+import platform
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -52,6 +53,20 @@ CONTAINER_PREFIX   = "judgegpt-model-"
 # to a native Ollama instance running on the host (e.g. with Metal GPU on Mac).
 # Example: NATIVE_OLLAMA_HOST=http://host.docker.internal:11435
 NATIVE_OLLAMA_HOST = os.getenv("NATIVE_OLLAMA_HOST", "").rstrip("/")
+
+# ── GPU platform detection ─────────────────────────────────────────────────────
+
+def _detect_gpu_platform() -> str:
+    """Return 'metal', 'nvidia', 'rocm', or 'cpu'."""
+    if NATIVE_OLLAMA_HOST and platform.system() == "Darwin":
+        return "metal"
+    if any(os.getenv(k) for k in ("HSA_OVERRIDE_GFX_VERSION", "ROCM_VERSION", "HIP_VISIBLE_DEVICES")):
+        return "rocm"
+    if any(os.getenv(k) for k in ("NVIDIA_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES")):
+        return "nvidia"
+    return "cpu"
+
+GPU_PLATFORM: str = _detect_gpu_platform()
 
 # ── Docker client ──────────────────────────────────────────────────────────────
 
@@ -288,6 +303,79 @@ async def kill_all_model_containers():
     for m in models:
         await kill_container(m)
 
+# ── GPU helpers ────────────────────────────────────────────────────────────────
+
+def _poll_gpu_from_container_sync(container_name: str) -> dict:
+    """Exec GPU-monitoring tools inside an Ollama Docker container (sync, run in executor)."""
+    if not docker_client:
+        return {}
+    try:
+        container = docker_client.containers.get(container_name)
+        # Try nvidia-smi first
+        try:
+            r = container.exec_run(
+                "nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total"
+                " --format=csv,noheader,nounits",
+                demux=True,
+            )
+            if r.exit_code == 0 and r.output[0]:
+                parts = r.output[0].decode().strip().split(",")
+                if len(parts) >= 3:
+                    return {
+                        "gpu_util_pct":  round(float(parts[0].strip()), 1),
+                        "vram_used_mb":  round(float(parts[1].strip()), 1),
+                        "vram_total_mb": round(float(parts[2].strip()), 1),
+                        "gpu_type": "nvidia",
+                    }
+        except Exception:
+            pass
+        # Try rocm-smi
+        try:
+            r = container.exec_run("rocm-smi --showuse --showmeminfo vram --json", demux=True)
+            if r.exit_code == 0 and r.output[0]:
+                data = json.loads(r.output[0])
+                utils, used, total = [], [], []
+                for card_data in data.values():
+                    if isinstance(card_data, dict):
+                        u  = card_data.get("GPU use (%)")
+                        vu = card_data.get("VRAM Total Used Memory (B)")
+                        vt = card_data.get("VRAM Total Memory (B)")
+                        if u  is not None: utils.append(float(u))
+                        if vu is not None: used.append(float(vu) / 1024 / 1024)
+                        if vt is not None: total.append(float(vt) / 1024 / 1024)
+                out: dict = {"gpu_type": "rocm"}
+                if utils: out["gpu_util_pct"]  = round(sum(utils) / len(utils), 1)
+                if used:  out["vram_used_mb"]  = round(sum(used), 1)
+                if total: out["vram_total_mb"] = round(sum(total), 1)
+                if out.get("gpu_util_pct") is not None:
+                    return out
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return {}
+
+
+async def _get_vram_from_ps(ollama_url: str, model_name: str) -> dict:
+    """Query Ollama /api/ps for VRAM used by a model (works on all platforms)."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{ollama_url}/api/ps",
+                timeout=aiohttp.ClientTimeout(total=2),
+            ) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    model_base = model_name.split(":")[0]
+                    for m in data.get("models", []):
+                        if model_base in m.get("name", ""):
+                            size_vram = m.get("size_vram", 0)
+                            if size_vram > 0:
+                                return {"vram_used_mb": round(size_vram / 1024 / 1024, 1)}
+    except Exception:
+        pass
+    return {}
+
 # ── Benchmark runner ───────────────────────────────────────────────────────────
 
 async def run_single(
@@ -296,8 +384,9 @@ async def run_single(
     prompt: str,
     n_tokens: int,
 ) -> dict:
-    """Run one inference pass, return TPS + TTFT + response text."""
+    """Run one inference pass, return TPS + TTFT + GPU perf + response text."""
     url = container_info["internal_url"]
+    container_name = container_info.get("container_name")  # None in native mode
     payload = {
         "model": model_name,
         "prompt": prompt,
@@ -310,52 +399,109 @@ async def run_single(
     tokens = 0
     response_text = ""
 
-    async with aiohttp.ClientSession() as session:
-        async with session.post(
-            f"{url}/api/generate",
-            json=payload,
-            timeout=aiohttp.ClientTimeout(total=300),
-        ) as resp:
-            if resp.status != 200:
-                body = await resp.text()
-                # Try to extract the Ollama error message from JSON
-                try:
-                    detail = json.loads(body).get("error", body[:200])
-                except Exception:
-                    detail = body[:200]
-                raise RuntimeError(f"Ollama returned {resp.status}: {detail}")
-            async for line in resp.content:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    chunk = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if t_first is None:
-                    t_first = time.perf_counter()
-                token_text = chunk.get("response", "")
-                response_text += token_text
-                if token_text:
-                    tokens += 1
-                if chunk.get("done"):
-                    # Ollama gives us eval_count and eval_duration
-                    eval_count    = chunk.get("eval_count", tokens)
-                    eval_duration = chunk.get("eval_duration", 1) / 1e9  # ns → s
-                    prompt_duration = chunk.get("prompt_eval_duration", 0) / 1e9
-                    break
+    # Done-chunk telemetry
+    eval_count        = 0
+    eval_duration_s   = 1.0
+    load_duration_ms  = 0.0
+    total_duration_ms = 0.0
+    prompt_eval_count = 0
+    prompt_tps        = 0.0
+
+    # GPU polling: collect samples during inference
+    gpu_samples: list[dict] = []
+
+    async def _gpu_poll():
+        while True:
+            stats: dict = {}
+            if container_name and docker_client and GPU_PLATFORM in ("nvidia", "rocm"):
+                loop = asyncio.get_event_loop()
+                stats = await loop.run_in_executor(
+                    None, _poll_gpu_from_container_sync, container_name
+                )
+            if not stats:
+                stats = await _get_vram_from_ps(url, model_name)
+            if stats:
+                gpu_samples.append(stats)
+            await asyncio.sleep(1.5)
+
+    gpu_task = asyncio.create_task(_gpu_poll())
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{url}/api/generate",
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=300),
+            ) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    try:
+                        detail = json.loads(body).get("error", body[:200])
+                    except Exception:
+                        detail = body[:200]
+                    raise RuntimeError(f"Ollama returned {resp.status}: {detail}")
+                async for line in resp.content:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        chunk = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if t_first is None:
+                        t_first = time.perf_counter()
+                    token_text = chunk.get("response", "")
+                    response_text += token_text
+                    if token_text:
+                        tokens += 1
+                    if chunk.get("done"):
+                        eval_count        = chunk.get("eval_count", tokens)
+                        eval_duration_s   = chunk.get("eval_duration", 1) / 1e9
+                        load_duration_ms  = round(chunk.get("load_duration", 0) / 1e6, 1)
+                        total_duration_ms = round(chunk.get("total_duration", 0) / 1e6, 1)
+                        prompt_eval_count = chunk.get("prompt_eval_count", 0)
+                        _prompt_dur_s     = chunk.get("prompt_eval_duration", 0) / 1e9
+                        prompt_tps        = round(prompt_eval_count / _prompt_dur_s, 1) if _prompt_dur_s > 0 else 0
+                        break
+    finally:
+        gpu_task.cancel()
+        try:
+            await gpu_task
+        except asyncio.CancelledError:
+            pass
 
     t_end = time.perf_counter()
     elapsed = t_end - t_start
     ttft_ms = round((t_first - t_start) * 1000, 1) if t_first else 0
-    tps = round(eval_count / eval_duration, 1) if eval_duration > 0 else 0
+    tps = round(eval_count / eval_duration_s, 1) if eval_duration_s > 0 else 0
+
+    # Aggregate GPU samples
+    gpu_result: dict = {}
+    if gpu_samples:
+        utils = [s["gpu_util_pct"] for s in gpu_samples if "gpu_util_pct" in s]
+        vraam = [s["vram_used_mb"] for s in gpu_samples if "vram_used_mb" in s]
+        if utils:
+            gpu_result["gpu_util_pct"] = round(max(utils), 1)
+        if vraam:
+            gpu_result["vram_used_mb"] = round(max(vraam), 1)
+        vram_total = next((s.get("vram_total_mb") for s in gpu_samples if s.get("vram_total_mb")), None)
+        if vram_total:
+            gpu_result["vram_total_mb"] = vram_total
+        gpu_type = next((s.get("gpu_type") for s in gpu_samples if s.get("gpu_type")), None)
+        if gpu_type:
+            gpu_result["gpu_type"] = gpu_type
 
     return {
         "tps": tps,
         "ttft_ms": ttft_ms,
         "tokens": eval_count,
         "duration_ms": round(elapsed * 1000, 1),
+        "load_duration_ms": load_duration_ms,
+        "total_duration_ms": total_duration_ms,
+        "prompt_eval_count": prompt_eval_count,
+        "prompt_tps": prompt_tps,
         "response": response_text.strip(),
+        **gpu_result,
     }
 
 
@@ -409,21 +555,33 @@ async def benchmark_model(
     if not runs:
         return None
 
-    tps_vals  = [r["tps"]     for r in runs]
-    ttft_vals = [r["ttft_ms"] for r in runs]
+    tps_vals        = [r["tps"]              for r in runs]
+    ttft_vals       = [r["ttft_ms"]          for r in runs]
+    load_vals       = [r.get("load_duration_ms",  0) for r in runs]
+    prompt_tps_vals = [r.get("prompt_tps",        0) for r in runs]
     result = {
-        "model":     model_name,
-        "color":     model_color(model_name),
-        "runs":      runs,
-        "tps_mean":  round(sum(tps_vals) / len(tps_vals), 1),
-        "tps_max":   round(max(tps_vals), 1),
-        "tps_min":   round(min(tps_vals), 1),
-        "ttft_mean": round(sum(ttft_vals) / len(ttft_vals), 1),
-        "ttft_min":  round(min(ttft_vals), 1),
-        "response":  runs[-1]["response"],
-        "prompt":    prompt,
-        "timestamp": time.time(),
+        "model":           model_name,
+        "color":           model_color(model_name),
+        "runs":            runs,
+        "tps_mean":        round(sum(tps_vals)        / len(tps_vals),        1),
+        "tps_max":         round(max(tps_vals),                               1),
+        "tps_min":         round(min(tps_vals),                               1),
+        "ttft_mean":       round(sum(ttft_vals)       / len(ttft_vals),       1),
+        "ttft_min":        round(min(ttft_vals),                              1),
+        "load_ms_mean":    round(sum(load_vals)       / len(load_vals),       1),
+        "prompt_tps_mean": round(sum(prompt_tps_vals) / len(prompt_tps_vals), 1),
+        "response":        runs[-1]["response"],
+        "prompt":          prompt,
+        "timestamp":       time.time(),
     }
+    # GPU stats — peak across runs
+    gpu_utils = [r["gpu_util_pct"] for r in runs if r.get("gpu_util_pct") is not None]
+    vram_used = [r["vram_used_mb"] for r in runs if r.get("vram_used_mb")  is not None]
+    if gpu_utils: result["gpu_util_pct_peak"] = round(max(gpu_utils), 1)
+    if vram_used: result["vram_used_mb"]       = round(max(vram_used), 1)
+    for field in ("vram_total_mb", "gpu_type"):
+        v = next((r[field] for r in runs if r.get(field)), None)
+        if v is not None: result[field] = v
     _benchmark_results[model_name] = result
     await event_queue.put({"event": "model_complete", "model": model_name, "result": result})
     return result
@@ -1045,6 +1203,25 @@ def export_pdf(req: ExportPDFRequest):
     )
 
 
+@app.get("/gpu/info")
+async def gpu_info():
+    """Return GPU platform and live Ollama /api/ps VRAM data."""
+    url = NATIVE_OLLAMA_HOST if NATIVE_OLLAMA_HOST else JUDGE_OLLAMA_URL
+    models_loaded = []
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"{url}/api/ps", timeout=aiohttp.ClientTimeout(total=2)) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    models_loaded = data.get("models", [])
+    except Exception:
+        pass
+    return {
+        "platform": GPU_PLATFORM,
+        "models_loaded": models_loaded,
+    }
+
+
 @app.get("/metrics")
 def metrics():
     from fastapi.responses import PlainTextResponse
@@ -1081,8 +1258,26 @@ async def stream_live_endpoint(req: StreamLiveRequest):
             return
 
         url = container_info["internal_url"]
+        container_name = container_info.get("container_name")
         t_start = time.perf_counter()
         t_first = None
+
+        # GPU polling: emit gpu_stats events every ~2s during streaming
+        async def _gpu_poll():
+            while True:
+                stats: dict = {}
+                if container_name and docker_client and GPU_PLATFORM in ("nvidia", "rocm"):
+                    loop = asyncio.get_event_loop()
+                    stats = await loop.run_in_executor(
+                        None, _poll_gpu_from_container_sync, container_name
+                    )
+                if not stats:
+                    stats = await _get_vram_from_ps(url, model_name)
+                if stats:
+                    await queue.put({"event": "gpu_stats", "model": model_name, **stats})
+                await asyncio.sleep(2.0)
+
+        gpu_task = asyncio.create_task(_gpu_poll())
 
         try:
             async with aiohttp.ClientSession() as session:
@@ -1108,15 +1303,34 @@ async def stream_live_endpoint(req: StreamLiveRequest):
                         if text:
                             await queue.put({"event": "token", "model": model_name, "text": text})
                         if chunk.get("done"):
-                            eval_count    = chunk.get("eval_count", 0)
-                            eval_duration = chunk.get("eval_duration", 1) / 1e9
-                            tps  = round(eval_count / eval_duration, 1) if eval_duration else 0
-                            ttft = round((t_first - t_start) * 1000, 1) if t_first else 0
-                            await queue.put({"event": "model_done", "model": model_name,
-                                           "tps": tps, "ttft_ms": ttft, "tokens": eval_count})
+                            eval_count     = chunk.get("eval_count", 0)
+                            eval_dur_s     = chunk.get("eval_duration", 1) / 1e9
+                            tps            = round(eval_count / eval_dur_s, 1) if eval_dur_s else 0
+                            ttft           = round((t_first - t_start) * 1000, 1) if t_first else 0
+                            load_ms        = round(chunk.get("load_duration", 0) / 1e6, 1)
+                            total_ms       = round(chunk.get("total_duration", 0) / 1e6, 1)
+                            prompt_count   = chunk.get("prompt_eval_count", 0)
+                            _prompt_dur_s  = chunk.get("prompt_eval_duration", 0) / 1e9
+                            prompt_tps_val = round(prompt_count / _prompt_dur_s, 1) if _prompt_dur_s > 0 else 0
+                            await queue.put({
+                                "event": "model_done",
+                                "model": model_name,
+                                "tps": tps,
+                                "ttft_ms": ttft,
+                                "tokens": eval_count,
+                                "load_duration_ms": load_ms,
+                                "total_duration_ms": total_ms,
+                                "prompt_tps": prompt_tps_val,
+                            })
                             break
         except Exception as e:
             await queue.put({"event": "model_error", "model": model_name, "error": str(e)})
+        finally:
+            gpu_task.cancel()
+            try:
+                await gpu_task
+            except asyncio.CancelledError:
+                pass
 
     async def sse_stream() -> AsyncGenerator[str, None]:
         async def run_all():
