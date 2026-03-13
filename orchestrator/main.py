@@ -11,6 +11,7 @@ M1 Mac: Ollama containers use Metal GPU automatically via the
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import logging
 import os
@@ -745,6 +746,298 @@ def export_csv():
         ]))
     return PlainTextResponse("\n".join(rows), media_type="text/csv",
                              headers={"Content-Disposition": "attachment; filename=judgegpt-results.csv"})
+
+class ExportPDFRequest(BaseModel):
+    prompt: str = ""
+    n_tokens: int = 512
+    n_runs: int = 3
+    results: dict = {}
+    judge_scores: dict = {}
+    leaderboard: list = []
+
+
+@app.post("/export/pdf")
+def export_pdf(req: ExportPDFRequest):
+    """Generate a PDF benchmark report and return it as a download."""
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.lib.units import inch
+    from reportlab.platypus import (
+        HRFlowable, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle,
+    )
+
+    # ── Colour palette ────────────────────────────────────────────────────────
+    C_DARK    = colors.HexColor('#0d1117')
+    C_SURFACE = colors.HexColor('#f5f7fa')
+    C_BORDER  = colors.HexColor('#d0d7de')
+    C_ROW_ALT = colors.HexColor('#eaf0f6')
+    C_CYAN    = colors.HexColor('#0077aa')
+    C_PURPLE  = colors.HexColor('#6e40c9')
+    C_MUTED   = colors.HexColor('#7d8590')
+    C_TEXT    = colors.HexColor('#1a1d23')
+    C_WHITE   = colors.white
+    C_GOLD    = colors.HexColor('#b08800')
+
+    buf = io.BytesIO()
+    W, H = letter
+    margin = 0.75 * inch
+    usable_w = W - 2 * margin
+
+    doc = SimpleDocTemplate(
+        buf, pagesize=letter,
+        topMargin=0.5 * inch, bottomMargin=0.5 * inch,
+        leftMargin=margin, rightMargin=margin,
+    )
+
+    # ── Reusable styles ───────────────────────────────────────────────────────
+    def section_hdr(text):
+        return Paragraph(text, ParagraphStyle(
+            'SH', fontName='Courier-Bold', fontSize=8, textColor=C_MUTED,
+            spaceBefore=14, spaceAfter=5,
+        ))
+
+    def note(text):
+        return Paragraph(text, ParagraphStyle(
+            'Note', fontName='Courier', fontSize=7, textColor=C_MUTED,
+            spaceAfter=4,
+        ))
+
+    story = []
+
+    # ── Title banner ─────────────────────────────────────────────────────────
+    ts = time.strftime('%Y-%m-%d %H:%M:%S')
+    banner = Table(
+        [['JudgeGPT  Benchmark Report', f'Generated: {ts}']],
+        colWidths=[usable_w * 0.6, usable_w * 0.4],
+    )
+    banner.setStyle(TableStyle([
+        ('BACKGROUND',    (0, 0), (-1, -1), C_DARK),
+        ('TEXTCOLOR',     (0, 0), (0,  0),  C_CYAN),
+        ('TEXTCOLOR',     (1, 0), (1,  0),  C_MUTED),
+        ('FONTNAME',      (0, 0), (0,  0),  'Courier-Bold'),
+        ('FONTNAME',      (1, 0), (1,  0),  'Courier'),
+        ('FONTSIZE',      (0, 0), (0,  0),  16),
+        ('FONTSIZE',      (1, 0), (1,  0),  8),
+        ('ALIGN',         (0, 0), (0,  0),  'LEFT'),
+        ('ALIGN',         (1, 0), (1,  0),  'RIGHT'),
+        ('VALIGN',        (0, 0), (-1, -1), 'MIDDLE'),
+        ('LEFTPADDING',   (0, 0), (-1, -1), 14),
+        ('RIGHTPADDING',  (0, 0), (-1, -1), 14),
+        ('TOPPADDING',    (0, 0), (-1, -1), 14),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 14),
+    ]))
+    story.append(banner)
+
+    # Config strip
+    n_tok_label = 'unlimited' if req.n_tokens == -1 else str(req.n_tokens)
+    config_strip = Table(
+        [[f'Runs per model: {req.n_runs}',
+          f'Max tokens: {n_tok_label}',
+          f'Models benchmarked: {len(req.results)}']],
+        colWidths=[usable_w / 3] * 3,
+    )
+    config_strip.setStyle(TableStyle([
+        ('BACKGROUND',    (0, 0), (-1, -1), C_SURFACE),
+        ('FONTNAME',      (0, 0), (-1, -1), 'Courier'),
+        ('FONTSIZE',      (0, 0), (-1, -1), 8),
+        ('TEXTCOLOR',     (0, 0), (-1, -1), C_MUTED),
+        ('ALIGN',         (0, 0), (-1, -1), 'CENTER'),
+        ('TOPPADDING',    (0, 0), (-1, -1), 6),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+        ('GRID',          (0, 0), (-1, -1), 0.5, C_BORDER),
+    ]))
+    story.append(config_strip)
+    story.append(Spacer(1, 14))
+
+    # ── Prompt ───────────────────────────────────────────────────────────────
+    if req.prompt:
+        story.append(section_hdr('BENCHMARK PROMPT'))
+        words = len(req.prompt.split())
+        story.append(note(f'{words} words · {len(req.prompt)} characters'))
+        prompt_box = Table(
+            [[req.prompt]],
+            colWidths=[usable_w],
+        )
+        prompt_box.setStyle(TableStyle([
+            ('BACKGROUND',    (0, 0), (-1, -1), C_SURFACE),
+            ('FONTNAME',      (0, 0), (-1, -1), 'Helvetica'),
+            ('FONTSIZE',      (0, 0), (-1, -1), 11),
+            ('TEXTCOLOR',     (0, 0), (-1, -1), C_TEXT),
+            ('LEFTPADDING',   (0, 0), (-1, -1), 12),
+            ('RIGHTPADDING',  (0, 0), (-1, -1), 12),
+            ('TOPPADDING',    (0, 0), (-1, -1), 10),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 10),
+            ('LINEABOVE',     (0, 0), (-1,  0),  3, C_PURPLE),
+            ('BOX',           (0, 0), (-1, -1), 0.5, C_BORDER),
+        ]))
+        story.append(prompt_box)
+        story.append(Spacer(1, 14))
+
+    # ── Performance results ───────────────────────────────────────────────────
+    if req.results:
+        story.append(section_hdr('PERFORMANCE RESULTS'))
+        hdr = [['Model', 'Avg TPS', 'TTFT (ms)', 'Tokens', 'Duration (ms)']]
+        rows = sorted(
+            [
+                [
+                    name,
+                    f"{r.get('tps_mean', '—')} t/s",
+                    f"{r.get('ttft_mean', '—')}",
+                    str(r.get('tokens_mean', '—')),
+                    str(r.get('duration_mean', '—')),
+                ]
+                for name, r in req.results.items()
+            ],
+            key=lambda x: float(str(x[1]).split()[0]) if str(x[1]).split()[0].replace('.','').isdigit() else 0,
+            reverse=True,
+        )
+        perf_t = Table(
+            hdr + rows,
+            colWidths=[usable_w * 0.36, usable_w * 0.16, usable_w * 0.16, usable_w * 0.16, usable_w * 0.16],
+        )
+        perf_t.setStyle(TableStyle([
+            ('BACKGROUND',    (0, 0), (-1,  0),  C_DARK),
+            ('TEXTCOLOR',     (0, 0), (-1,  0),  C_WHITE),
+            ('FONTNAME',      (0, 0), (-1,  0),  'Courier-Bold'),
+            ('FONTNAME',      (0, 1), (-1, -1),  'Courier'),
+            ('FONTSIZE',      (0, 0), (-1, -1),  9),
+            ('TEXTCOLOR',     (0, 1), (-1, -1),  C_TEXT),
+            ('ALIGN',         (1, 0), (-1, -1),  'CENTER'),
+            ('ALIGN',         (0, 0), (0,  -1),  'LEFT'),
+            ('LEFTPADDING',   (0, 0), (0,  -1),  8),
+            ('TOPPADDING',    (0, 0), (-1, -1),  6),
+            ('BOTTOMPADDING', (0, 0), (-1, -1),  6),
+            ('GRID',          (0, 0), (-1, -1),  0.5, C_BORDER),
+            ('ROWBACKGROUNDS',(0, 1), (-1, -1),  [C_WHITE, C_ROW_ALT]),
+        ]))
+        story.append(perf_t)
+        story.append(Spacer(1, 14))
+
+    # ── Judge scores ─────────────────────────────────────────────────────────
+    CRITERIA = ['accuracy', 'clarity', 'depth', 'concision', 'examples']
+    CRIT_LABELS = ['Accuracy', 'Clarity', 'Depth', 'Concision', 'Examples']
+
+    if req.judge_scores:
+        story.append(section_hdr('JUDGE SCORES  (out of 5)'))
+        model_names = list(req.judge_scores.keys())
+        col_w = (usable_w - usable_w * 0.22) / max(len(model_names), 1)
+        j_hdr = [['Criterion'] + [m.split(':')[0] for m in model_names]]
+        j_rows = []
+        for key, label in zip(CRITERIA, CRIT_LABELS):
+            row = [label]
+            for m in model_names:
+                v = req.judge_scores[m].get(key)
+                row.append(f"{v}/5" if v is not None else '—')
+            j_rows.append(row)
+        # Average row
+        avg_row = ['Average']
+        for m in model_names:
+            sc = req.judge_scores[m]
+            avg = sum(sc.get(k, 0) for k in CRITERIA) / len(CRITERIA)
+            avg_row.append(f"{avg:.2f}/5")
+        j_rows.append(avg_row)
+
+        judge_t = Table(
+            j_hdr + j_rows,
+            colWidths=[usable_w * 0.22] + [col_w] * len(model_names),
+        )
+        judge_t.setStyle(TableStyle([
+            ('BACKGROUND',    (0,  0), (-1,  0),  C_DARK),
+            ('TEXTCOLOR',     (0,  0), (-1,  0),  C_WHITE),
+            ('FONTNAME',      (0,  0), (-1,  0),  'Courier-Bold'),
+            ('FONTNAME',      (0,  1), (-1, -1),  'Courier'),
+            ('FONTSIZE',      (0,  0), (-1, -1),  9),
+            ('TEXTCOLOR',     (0,  1), (-1, -2),  C_TEXT),
+            ('ALIGN',         (1,  0), (-1, -1),  'CENTER'),
+            ('ALIGN',         (0,  0), (0,  -1),  'LEFT'),
+            ('LEFTPADDING',   (0,  0), (0,  -1),  8),
+            ('TOPPADDING',    (0,  0), (-1, -1),  5),
+            ('BOTTOMPADDING', (0,  0), (-1, -1),  5),
+            ('GRID',          (0,  0), (-1, -1),  0.5, C_BORDER),
+            ('ROWBACKGROUNDS',(0,  1), (-1, -2),  [C_WHITE, C_ROW_ALT]),
+            # Average row styling
+            ('FONTNAME',      (0, -1), (-1, -1),  'Courier-Bold'),
+            ('BACKGROUND',    (0, -1), (-1, -1),  colors.HexColor('#e8e4f3')),
+            ('LINEABOVE',     (0, -1), (-1, -1),  1, C_BORDER),
+        ]))
+        story.append(judge_t)
+        story.append(Spacer(1, 8))
+
+        # Reasoning snippets
+        for m in model_names:
+            r_text = req.judge_scores[m].get('reasoning', '')
+            if r_text:
+                snippet = r_text[:280] + ('...' if len(r_text) > 280 else '')
+                story.append(Paragraph(
+                    f'<i><b>{m.split(":")[0]}:</b>  {snippet}</i>',
+                    ParagraphStyle('Rsn', fontName='Helvetica-Oblique', fontSize=9,
+                                   textColor=C_MUTED, leftIndent=8, spaceAfter=3),
+                ))
+        story.append(Spacer(1, 10))
+
+    # ── Leaderboard ───────────────────────────────────────────────────────────
+    if req.leaderboard:
+        story.append(section_hdr('LEADERBOARD'))
+        story.append(note('Combined score = TPS x35% + TTFT x15% + Quality x50%'))
+        medals = {1: '#1', 2: '#2', 3: '#3'}
+        lb_hdr = [['Rank', 'Model', 'TPS Score', 'TTFT Score', 'Quality', 'Combined']]
+        lb_rows = []
+        for e in req.leaderboard:
+            rank = e.get('rank', '—')
+            lb_rows.append([
+                medals.get(rank, f'#{rank}'),
+                e.get('model', '—'),
+                f"{e['tps_score']:.1f}"     if e.get('tps_score')     is not None else '—',
+                f"{e['ttft_score']:.1f}"    if e.get('ttft_score')    is not None else '—',
+                f"{e['quality_score']:.1f}" if e.get('quality_score') is not None else '—',
+                f"{e['combined_score']:.1f}" if e.get('combined_score') is not None else '—',
+            ])
+        lb_t = Table(
+            lb_hdr + lb_rows,
+            colWidths=[usable_w * 0.08, usable_w * 0.32, usable_w * 0.14,
+                       usable_w * 0.14, usable_w * 0.14, usable_w * 0.14],
+        )
+        lb_t.setStyle(TableStyle([
+            ('BACKGROUND',    (0, 0), (-1,  0), C_DARK),
+            ('TEXTCOLOR',     (0, 0), (-1,  0), C_WHITE),
+            ('FONTNAME',      (0, 0), (-1,  0), 'Courier-Bold'),
+            ('FONTNAME',      (0, 1), (-1, -1), 'Courier'),
+            ('FONTSIZE',      (0, 0), (-1, -1), 9),
+            ('TEXTCOLOR',     (0, 1), (-1, -1), C_TEXT),
+            ('ALIGN',         (0, 0), (0,  -1), 'CENTER'),
+            ('ALIGN',         (1, 0), (1,  -1), 'LEFT'),
+            ('ALIGN',         (2, 0), (-1, -1), 'CENTER'),
+            ('LEFTPADDING',   (1, 0), (1,  -1), 8),
+            ('TOPPADDING',    (0, 0), (-1, -1), 6),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+            ('GRID',          (0, 0), (-1, -1), 0.5, C_BORDER),
+            ('ROWBACKGROUNDS',(0, 1), (-1, -1), [C_WHITE, C_ROW_ALT]),
+            # Gold for rank-1
+            ('TEXTCOLOR',     (0, 1), (0,  1),  C_GOLD),
+            ('FONTNAME',      (0, 1), (-1,  1), 'Courier-Bold'),
+        ]))
+        story.append(lb_t)
+        story.append(Spacer(1, 14))
+
+    # ── Footer ────────────────────────────────────────────────────────────────
+    story.append(HRFlowable(width=usable_w, thickness=0.5, color=C_BORDER))
+    story.append(Paragraph(
+        f'Generated by JudgeGPT  |  {ts}',
+        ParagraphStyle('Footer', fontName='Courier', fontSize=7,
+                       textColor=C_MUTED, spaceBefore=6, alignment=1),
+    ))
+
+    doc.build(story)
+    buf.seek(0)
+
+    fname = f'judgegpt-report-{time.strftime("%Y%m%d-%H%M%S")}.pdf'
+    return StreamingResponse(
+        buf,
+        media_type='application/pdf',
+        headers={'Content-Disposition': f'attachment; filename="{fname}"'},
+    )
+
 
 @app.get("/metrics")
 def metrics():

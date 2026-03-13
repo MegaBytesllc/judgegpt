@@ -177,6 +177,9 @@ export default function App() {
   const [history, setHistory]             = useState([])
   const [historyLoading, setHistoryLoading] = useState(false)
 
+  // ── Last-run config (captured at run time for metrics scope card) ────────────
+  const [lastRunConfig, setLastRunConfig] = useState({ prompt:'', nTokens:512, nRuns:3 })
+
   // ── Playground tab state ───────────────────────────────────────────────────
   const [playPanels, setPlayPanels]   = useState([DEFAULT_PANEL(0), DEFAULT_PANEL(1)])
   const [playPrompt, setPlayPrompt]   = useState('')
@@ -257,7 +260,27 @@ export default function App() {
     })
   }, [playTexts])
 
-  const allModels = [...catalog, ...customModels.map(n => ({ name:n, color:'#aaaaaa', custom:true }))]
+  // Models downloaded in Ollama but not in the preset catalog or custom list
+  const catalogBaseNames = new Set(catalog.map(m => m.name.split(':')[0]))
+  const customNames = new Set(customModels)
+  const localOnlyModels = localModels
+    .filter(lm => {
+      if (customNames.has(lm.name)) return false
+      const base = lm.name.split(':')[0]
+      return !catalogBaseNames.has(base)
+    })
+    .map(lm => ({
+      name: lm.name,
+      color: '#5ccfe6',
+      local: true,
+      size_gb: lm.size ? (lm.size / 1e9).toFixed(1) : null,
+    }))
+
+  const allModels = [
+    ...catalog,
+    ...customModels.map(n => ({ name:n, color:'#aaaaaa', custom:true })),
+    ...localOnlyModels,
+  ]
 
   // ── Model pull ─────────────────────────────────────────────────────────────
   const pullModel = async (modelName) => {
@@ -317,8 +340,41 @@ export default function App() {
     setJudgeScores(entry.judge_scores || {})
     setLeaderboard(entry.leaderboard || [])
     setSelected(entry.models || [])
+    if (entry.prompt) {
+      setPrompt(entry.prompt)
+      setLastRunConfig({ prompt: entry.prompt, nTokens: entry.n_tokens ?? 512, nRuns: entry.n_runs ?? 3 })
+    }
     addLog(`📚 Restored run from ${new Date(entry.timestamp * 1000).toLocaleString()}`, 'cyan')
     setTab('metrics')
+  }
+
+  // ── PDF export ─────────────────────────────────────────────────────────────
+  const exportPDF = async () => {
+    try {
+      const res = await fetch(`${API}/export/pdf`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          prompt:       lastRunConfig.prompt || prompt,
+          n_tokens:     lastRunConfig.nTokens ?? nTokens,
+          n_runs:       lastRunConfig.nRuns ?? nRuns,
+          results,
+          judge_scores: judgeScores,
+          leaderboard,
+        }),
+      })
+      if (!res.ok) throw new Error(`Server error ${res.status}`)
+      const blob = await res.blob()
+      const url  = URL.createObjectURL(blob)
+      const a    = document.createElement('a')
+      a.href     = url
+      a.download = `judgegpt-report-${Date.now()}.pdf`
+      a.click()
+      URL.revokeObjectURL(url)
+      addLog('↓ PDF report downloaded', 'green')
+    } catch (e) {
+      addLog(`PDF export failed: ${e.message}`, 'error')
+    }
   }
 
   const addCustomModel = () => {
@@ -338,6 +394,7 @@ export default function App() {
     setJudgeScores({})
     setLeaderboard([])
     setContainerStatus({})
+    setLastRunConfig({ prompt, nTokens, nRuns })
     addLog(`▶ Starting benchmark: ${selected.join(', ')}`, 'cyan')
     addLog(`  Prompt: "${prompt.slice(0,55)}…"`)
     addLog(`  ${nRuns} runs · ${nTokens} tokens · judge: ${autoJudge}`)
@@ -630,89 +687,186 @@ export default function App() {
             <SectionHeader>Configure Benchmark</SectionHeader>
 
             <div style={{ background:'var(--surface)', border:'1px solid var(--border)', borderRadius:8, padding:18 }}>
-              <div style={{ fontSize:10, color:'var(--muted)', textTransform:'uppercase', letterSpacing:1, marginBottom:12 }}>Select Models</div>
-              <div style={{ display:'grid', gridTemplateColumns:'repeat(auto-fill,minmax(210px,1fr))', gap:8 }}>
-                {allModels.map(m => {
-                  const on       = selected.includes(m.name)
-                  const col      = m.color || '#888'
-                  const phase    = containerStatus[m.name]
-                  const base     = m.name.split(':')[0]
-                  const isLocal  = localModels.some(lm => lm.name === m.name || lm.name.startsWith(base + ':'))
-                  const pulling  = pullStatus[m.name] === 'pulling'
-                  const pullDone = pullStatus[m.name] === 'done'
-                  const pullErr  = pullStatus[m.name] === 'error'
-                  const pct      = pullProgress[m.name] ?? 0
-                  return (
-                    <button key={m.name} onClick={() => setSelected(p =>
-                      p.includes(m.name) ? p.filter(x=>x!==m.name) : [...p,m.name]
-                    )} style={{
-                      background: on ? col+'18' : 'var(--surface2)',
-                      border:`1px solid ${on ? col : 'var(--border)'}`,
-                      borderRadius:6, padding:'8px 12px', textAlign:'left',
-                      color: on ? col : 'var(--muted)', transition:'all 0.15s',
-                      display:'flex', flexDirection:'column', gap:0,
-                    }}>
-                      <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between' }}>
-                        <div>
-                          <div style={{ fontFamily:'var(--mono)', fontSize:11 }}>{m.name}</div>
-                          {m.size_gb && <div style={{ fontSize:10, color:'var(--muted)', marginTop:2 }}>{m.size_gb} GB</div>}
-                          {m.custom && <div style={{ fontSize:10, color:'var(--yellow)', marginTop:2 }}>custom</div>}
-                        </div>
-                        <div style={{ display:'flex', alignItems:'center', gap:6 }}>
-                          {phase && <Dot color={statusColor[phase]||'var(--muted)'} pulse={phase==='spawning'} />}
-                          <div style={{ width:14, height:14, borderRadius:'50%',
-                            background: on ? col : 'var(--border)',
-                            border:`2px solid ${on ? col : 'var(--border2)'}`,
-                            boxShadow: on ? `0 0 8px ${col}` : 'none', transition:'all 0.15s' }} />
-                        </div>
-                      </div>
-
-                      {/* Pull status row */}
-                      {pulling ? (
-                        <div style={{ marginTop:6 }}>
-                          <div style={{ height:2, background:'var(--border)', borderRadius:1, overflow:'hidden' }}>
-                            <div style={{ width:`${pct}%`, height:'100%', background:col, transition:'width 0.4s' }} />
-                          </div>
-                          <div style={{ fontSize:9, color:'var(--muted)', marginTop:3, fontFamily:'var(--mono)',
-                            display:'flex', justifyContent:'space-between' }}>
-                            <span style={{ overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap', maxWidth:120 }}>
-                              {pullMsg[m.name] || 'pulling…'}
-                            </span>
-                            <span>{pct}%</span>
-                          </div>
-                        </div>
-                      ) : isLocal || pullDone ? (
-                        <div style={{ fontSize:9, color:'var(--green)', marginTop:5, fontFamily:'var(--mono)' }}>✓ ready</div>
-                      ) : pullErr ? (
-                        <div style={{ fontSize:9, color:'var(--orange)', marginTop:5, fontFamily:'var(--mono)',
-                          display:'flex', justifyContent:'space-between', alignItems:'center' }}>
-                          <span>pull failed</span>
-                          <span onClick={e => { e.stopPropagation(); pullModel(m.name) }}
-                            style={{ cursor:'pointer', color:'var(--cyan)', textDecoration:'underline' }}>retry</span>
-                        </div>
-                      ) : (
-                        <button onClick={e => { e.stopPropagation(); pullModel(m.name) }} style={{
-                          marginTop:5, fontSize:9, color:'var(--cyan)',
-                          background:'transparent', border:'1px solid var(--cyan)44',
-                          borderRadius:3, padding:'2px 7px', fontFamily:'var(--mono)',
-                          cursor:'pointer', alignSelf:'flex-start',
-                        }}>↓ pull</button>
-                      )}
-                    </button>
-                  )
-                })}
+              {/* ── Model directory header ── */}
+              <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:16 }}>
+                <div style={{ fontSize:10, color:'var(--muted)', textTransform:'uppercase', letterSpacing:1 }}>
+                  Model Directory
+                </div>
+                <div style={{ display:'flex', gap:6, alignItems:'center' }}>
+                  <span style={{ fontSize:10, color:'var(--green)', fontFamily:'var(--mono)' }}>
+                    {localModels.length} installed
+                  </span>
+                  <span style={{ color:'var(--border2)' }}>·</span>
+                  <span style={{ fontSize:10, color:'var(--muted)', fontFamily:'var(--mono)' }}>
+                    {selected.length} selected
+                  </span>
+                </div>
               </div>
-              <div style={{ marginTop:12, display:'flex', gap:8 }}>
+
+              {/* ── Installed section ── */}
+              {allModels.filter(m => {
+                const base = m.name.split(':')[0]
+                return m.local || pullStatus[m.name]==='done' || localModels.some(lm => lm.name===m.name || lm.name.startsWith(base+':'))
+              }).length > 0 && (
+                <div style={{ marginBottom:14 }}>
+                  <div style={{ fontSize:9, color:'var(--green)', fontFamily:'var(--mono)',
+                    textTransform:'uppercase', letterSpacing:1.5, marginBottom:8,
+                    display:'flex', alignItems:'center', gap:6 }}>
+                    <span style={{ width:6, height:6, borderRadius:'50%', background:'var(--green)', display:'inline-block' }} />
+                    Installed
+                  </div>
+                  <div style={{ display:'flex', flexDirection:'column', gap:2 }}>
+                    {allModels.filter(m => {
+                      const base = m.name.split(':')[0]
+                      return m.local || pullStatus[m.name]==='done' || localModels.some(lm => lm.name===m.name || lm.name.startsWith(base+':'))
+                    }).map(m => {
+                      const on  = selected.includes(m.name)
+                      const col = m.color || '#888'
+                      const phase = containerStatus[m.name]
+                      return (
+                        <div key={m.name} onClick={() => setSelected(p =>
+                          p.includes(m.name) ? p.filter(x=>x!==m.name) : [...p,m.name]
+                        )} style={{
+                          display:'flex', alignItems:'center', gap:10,
+                          padding:'9px 12px', borderRadius:6, cursor:'pointer',
+                          background: on ? col+'14' : 'var(--surface2)',
+                          border:`1px solid ${on ? col+'66' : 'var(--border)'}`,
+                          transition:'all 0.15s',
+                        }}>
+                          {/* Color dot */}
+                          <div style={{ width:8, height:8, borderRadius:'50%', flexShrink:0,
+                            background:col, boxShadow:`0 0 6px ${col}88`,
+                            opacity: on ? 1 : 0.5 }} />
+                          {/* Name + meta */}
+                          <div style={{ flex:1, minWidth:0 }}>
+                            <span style={{ fontFamily:'var(--mono)', fontSize:12,
+                              color: on ? col : 'var(--text)' }}>{m.name}</span>
+                            <span style={{ fontSize:10, color:'var(--muted)', marginLeft:8, fontFamily:'var(--mono)' }}>
+                              {m.size_gb ? `${m.size_gb} GB` : ''}
+                              {m.custom ? ' · custom' : ''}
+                              {m.local ? ' · local' : ''}
+                            </span>
+                          </div>
+                          {/* Status */}
+                          <div style={{ display:'flex', alignItems:'center', gap:6, flexShrink:0 }}>
+                            {phase && <Dot color={statusColor[phase]||'var(--muted)'} pulse={phase==='spawning'} />}
+                            <span style={{ fontSize:9, color:'var(--green)', fontFamily:'var(--mono)' }}>✓ ready</span>
+                          </div>
+                          {/* Select indicator */}
+                          <div style={{ width:16, height:16, borderRadius:4, flexShrink:0,
+                            background: on ? col : 'transparent',
+                            border:`1.5px solid ${on ? col : 'var(--border2)'}`,
+                            display:'flex', alignItems:'center', justifyContent:'center',
+                            transition:'all 0.15s' }}>
+                            {on && <span style={{ color:'#000', fontSize:9, fontWeight:'bold', lineHeight:1 }}>✓</span>}
+                          </div>
+                        </div>
+                      )
+                    })}
+                  </div>
+                </div>
+              )}
+
+              {/* ── Available section ── */}
+              {allModels.filter(m => {
+                const base = m.name.split(':')[0]
+                return !m.local && pullStatus[m.name]!=='done' && !localModels.some(lm => lm.name===m.name || lm.name.startsWith(base+':'))
+              }).length > 0 && (
+                <div>
+                  <div style={{ fontSize:9, color:'var(--muted)', fontFamily:'var(--mono)',
+                    textTransform:'uppercase', letterSpacing:1.5, marginBottom:8,
+                    display:'flex', alignItems:'center', gap:6 }}>
+                    <span style={{ width:6, height:6, borderRadius:'50%', background:'var(--border2)', display:'inline-block' }} />
+                    Available — not downloaded
+                  </div>
+                  <div style={{ display:'grid', gridTemplateColumns:'repeat(auto-fill,minmax(240px,1fr))', gap:6 }}>
+                    {allModels.filter(m => {
+                      const base = m.name.split(':')[0]
+                      return !m.local && pullStatus[m.name]!=='done' && !localModels.some(lm => lm.name===m.name || lm.name.startsWith(base+':'))
+                    }).map(m => {
+                      const on      = selected.includes(m.name)
+                      const col     = m.color || '#888'
+                      const phase   = containerStatus[m.name]
+                      const pulling = pullStatus[m.name] === 'pulling'
+                      const pullErr = pullStatus[m.name] === 'error'
+                      const pct     = pullProgress[m.name] ?? 0
+                      return (
+                        <div key={m.name} style={{ borderRadius:6, overflow:'hidden',
+                          border:`1px solid ${on ? col+'55' : 'var(--border)'}`,
+                          background: on ? col+'0d' : 'var(--surface2)',
+                          transition:'all 0.15s' }}>
+                          {/* Top row — clickable for select */}
+                          <div onClick={() => setSelected(p =>
+                            p.includes(m.name) ? p.filter(x=>x!==m.name) : [...p,m.name]
+                          )} style={{ display:'flex', alignItems:'center', gap:8,
+                            padding:'9px 12px', cursor:'pointer' }}>
+                            <div style={{ width:8, height:8, borderRadius:'50%', flexShrink:0,
+                              background:col, opacity: on ? 0.9 : 0.35 }} />
+                            <div style={{ flex:1, minWidth:0 }}>
+                              <div style={{ fontFamily:'var(--mono)', fontSize:11,
+                                color: on ? col : 'var(--muted)', overflow:'hidden',
+                                textOverflow:'ellipsis', whiteSpace:'nowrap' }}>{m.name}</div>
+                              {m.size_gb && <div style={{ fontSize:9, color:'var(--border2)',
+                                fontFamily:'var(--mono)' }}>{m.size_gb} GB</div>}
+                            </div>
+                            {phase && <Dot color={statusColor[phase]||'var(--muted)'} pulse={phase==='spawning'} />}
+                            <div style={{ width:14, height:14, borderRadius:3, flexShrink:0,
+                              background: on ? col : 'transparent',
+                              border:`1.5px solid ${on ? col : 'var(--border2)'}`,
+                              display:'flex', alignItems:'center', justifyContent:'center' }}>
+                              {on && <span style={{ color:'#000', fontSize:8, fontWeight:'bold' }}>✓</span>}
+                            </div>
+                          </div>
+                          {/* Pull status bar */}
+                          <div style={{ padding:'0 12px 9px', borderTop:'1px solid var(--border)22' }}>
+                            {pulling ? (
+                              <>
+                                <div style={{ height:2, background:'var(--border)', borderRadius:1, overflow:'hidden', marginBottom:4 }}>
+                                  <div style={{ width:`${pct}%`, height:'100%', background:col, transition:'width 0.4s' }} />
+                                </div>
+                                <div style={{ fontSize:9, color:'var(--muted)', fontFamily:'var(--mono)',
+                                  display:'flex', justifyContent:'space-between' }}>
+                                  <span style={{ overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap', maxWidth:130 }}>
+                                    {pullMsg[m.name] || 'pulling…'}
+                                  </span>
+                                  <span>{pct}%</span>
+                                </div>
+                              </>
+                            ) : pullErr ? (
+                              <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center' }}>
+                                <span style={{ fontSize:9, color:'var(--orange)', fontFamily:'var(--mono)' }}>pull failed</span>
+                                <span onClick={e => { e.stopPropagation(); pullModel(m.name) }}
+                                  style={{ fontSize:9, cursor:'pointer', color:'var(--cyan)',
+                                    fontFamily:'var(--mono)', textDecoration:'underline' }}>retry</span>
+                              </div>
+                            ) : (
+                              <button onClick={e => { e.stopPropagation(); pullModel(m.name) }} style={{
+                                fontSize:9, color:'var(--cyan)',
+                                background:'transparent', border:'1px solid var(--cyan)44',
+                                borderRadius:3, padding:'2px 10px', fontFamily:'var(--mono)',
+                                cursor:'pointer', width:'100%',
+                              }}>↓ pull to install</button>
+                            )}
+                          </div>
+                        </div>
+                      )
+                    })}
+                  </div>
+                </div>
+              )}
+
+              {/* ── Add custom model ── */}
+              <div style={{ marginTop:14, paddingTop:12, borderTop:'1px solid var(--border)', display:'flex', gap:8 }}>
                 <input value={customModel} onChange={e => setCustomModel(e.target.value)}
                   onKeyDown={e => e.key==='Enter' && addCustomModel()}
-                  placeholder="Add custom model (e.g. llama3.2:3b)"
+                  placeholder="Add custom model tag (e.g. llama3.2:3b)"
                   style={{ flex:1, background:'var(--surface2)', border:'1px solid var(--border)',
                     borderRadius:6, padding:'7px 12px', color:'var(--text)',
                     fontFamily:'var(--mono)', fontSize:12, outline:'none' }} />
                 <button onClick={addCustomModel} style={{
                   background:'var(--yellow)18', border:'1px solid var(--yellow)',
                   color:'var(--yellow)', padding:'7px 16px', borderRadius:6,
-                  fontFamily:'var(--mono)', fontSize:12,
+                  fontFamily:'var(--mono)', fontSize:12, cursor:'pointer',
                 }}>+ Add</button>
               </div>
             </div>
@@ -838,7 +992,62 @@ export default function App() {
           <div style={{ display:'flex', flexDirection:'column', gap:20 }}>
             {!hasResults
               ? <div style={{ color:'var(--muted)', textAlign:'center', marginTop:80, fontFamily:'var(--mono)' }}>No results yet — run a benchmark first.</div>
-              : <>
+              : (() => {
+                  // Prompt scope analysis
+                  const scopePrompt = lastRunConfig.prompt || prompt
+                  const scopeWords = scopePrompt.trim().split(/\s+/).filter(Boolean).length
+                  const scopeChars = scopePrompt.length
+                  const lower = scopePrompt.toLowerCase()
+                  const scopeType =
+                    /\b(write|create|generate|compose|draft)\b/.test(lower) ? 'Creative' :
+                    /\b(code|function|program|implement|algorithm|script)\b/.test(lower) ? 'Technical' :
+                    /\b(compare|difference|vs|versus|which is better)\b/.test(lower) ? 'Comparative' :
+                    /\b(list|enumerate|steps|how to|procedure)\b/.test(lower) ? 'Instructional' :
+                    /\b(explain|describe|what is|why|how does)\b/.test(lower) ? 'Explanatory' :
+                    scopePrompt.includes('?') ? 'Question' : 'General'
+                  const scopeComplexity = scopeWords < 20 ? 'Simple' : scopeWords < 60 ? 'Moderate' : 'Complex'
+                  const scopeTokLabel = (lastRunConfig.nTokens || nTokens) === -1
+                    ? '∞ unlimited' : `${lastRunConfig.nTokens || nTokens} max`
+
+                  return <>
+                  {/* ── Scope card ── */}
+                  <div style={{ background:'var(--surface)', border:'1px solid var(--border)', borderRadius:8, padding:16 }}>
+                    <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:12 }}>
+                      <SectionHeader>Benchmark Scope</SectionHeader>
+                      <div style={{ display:'flex', gap:8 }}>
+                        <Tag color="var(--purple)">{scopeType}</Tag>
+                        <Tag color="var(--muted)">{scopeComplexity}</Tag>
+                      </div>
+                    </div>
+                    <div style={{ display:'flex', gap:16, alignItems:'flex-start', flexWrap:'wrap' }}>
+                      {/* Prompt quote */}
+                      <div style={{ flex:'1 1 340px', background:'var(--surface2)',
+                        borderLeft:'2px solid var(--purple)', borderRadius:'0 6px 6px 0',
+                        padding:'10px 14px', fontSize:13, color:'var(--text)', lineHeight:1.65,
+                        fontStyle:'italic', fontFamily:'var(--sans)' }}>
+                        "{scopePrompt}"
+                      </div>
+                      {/* Stats chips */}
+                      <div style={{ display:'flex', flexWrap:'wrap', gap:8, alignContent:'flex-start', paddingTop:4 }}>
+                        {[
+                          { label:'Words',     val:scopeWords,                            col:'var(--cyan)'   },
+                          { label:'Chars',     val:scopeChars,                            col:'var(--cyan)'   },
+                          { label:'Runs',      val:lastRunConfig.nRuns || nRuns,          col:'var(--yellow)' },
+                          { label:'Max tokens',val:scopeTokLabel,                         col:'var(--purple)' },
+                          { label:'Models',    val:resultList.length,                     col:'var(--green)'  },
+                        ].map(({ label, val, col }) => (
+                          <div key={label} style={{ background:'var(--surface2)',
+                            border:`1px solid ${col}33`, borderRadius:6,
+                            padding:'6px 12px', minWidth:70 }}>
+                            <div style={{ fontSize:9, color:'var(--muted)', textTransform:'uppercase',
+                              letterSpacing:1, marginBottom:3 }}>{label}</div>
+                            <div style={{ fontFamily:'var(--mono)', fontSize:13, color:col }}>{val}</div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+
                   <div style={{ display:'grid', gridTemplateColumns:'repeat(auto-fill,minmax(150px,1fr))', gap:10 }}>
                     <StatCard label="Models" value={resultList.length} color="var(--cyan)" />
                     <StatCard label="Fastest" value={Math.max(...resultList.map(r=>r.tps_mean)).toFixed(1)+'t/s'}
@@ -977,8 +1186,22 @@ export default function App() {
                       </ResponsiveContainer>
                     </div>
                   )}
-                </>
-            }
+
+                  {/* ── Export PDF button ── */}
+                  <div style={{ display:'flex', justifyContent:'flex-end' }}>
+                    <button onClick={exportPDF} style={{
+                      background:'linear-gradient(135deg,var(--purple)18,var(--cyan)18)',
+                      border:'1px solid var(--purple)',
+                      color:'var(--purple)', padding:'9px 20px', borderRadius:6,
+                      fontFamily:'var(--mono)', fontSize:12, letterSpacing:0.5,
+                      display:'flex', alignItems:'center', gap:8, cursor:'pointer',
+                      boxShadow:'0 0 16px var(--purple)22',
+                    }}>
+                      ↓ Export PDF Report
+                    </button>
+                  </div>
+                  </>
+              }})()}
           </div>
         )}
 
