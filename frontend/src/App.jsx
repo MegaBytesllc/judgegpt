@@ -945,19 +945,44 @@ export default function App() {
                     </div>
                   </div>
                 ))}
-                {autoJudge && (
-                  <div style={{ borderTop:'1px solid var(--border)', paddingTop:10, display:'flex', flexDirection:'column', gap:8 }}>
-                    <div style={{ fontSize:10, color:'var(--purple)', letterSpacing:1 }}>JUDGE CONFIG</div>
-                    <div>
-                      <div style={{ fontSize:9, color:'var(--muted)', marginBottom:4 }}>MODEL</div>
-                      <input
-                        value={judgeModel}
-                        onChange={e => { setJudgeModel(e.target.value); saveJudgeConfig(judgeSystemPrompt, e.target.value) }}
-                        style={{ width:'100%', background:'var(--surface2)', border:'1px solid var(--border)',
-                          color:'var(--fg)', fontFamily:'var(--mono)', fontSize:11, padding:'5px 8px',
-                          borderRadius:4, boxSizing:'border-box' }}
-                      />
+                {/* Judge Config — model picker always visible, system prompt only when auto-judge is on */}
+                <div style={{ borderTop:'1px solid var(--border)', paddingTop:10, display:'flex', flexDirection:'column', gap:8 }}>
+                  <div style={{ fontSize:10, color:'var(--purple)', letterSpacing:1 }}>JUDGE MODEL</div>
+
+                  {/* Quick-pick from installed models */}
+                  {localModels.length > 0 && (
+                    <div style={{ display:'flex', gap:4, flexWrap:'wrap' }}>
+                      {localModels.map(m => (
+                        <button
+                          key={m.name}
+                          onClick={() => { setJudgeModel(m.name); saveJudgeConfig(judgeSystemPrompt, m.name) }}
+                          style={{
+                            background: judgeModel === m.name ? 'var(--purple)30' : 'var(--surface2)',
+                            border: `1px solid ${judgeModel === m.name ? 'var(--purple)' : 'var(--border)'}`,
+                            color: judgeModel === m.name ? 'var(--purple)' : 'var(--muted)',
+                            fontFamily:'var(--mono)', fontSize:10, padding:'3px 8px', borderRadius:4,
+                            cursor:'pointer', transition:'all 0.15s',
+                          }}
+                        >
+                          {m.name.replace(/:.*/, '')}
+                          {judgeModel === m.name && <span style={{ marginLeft:5 }}>✓</span>}
+                        </button>
+                      ))}
                     </div>
+                  )}
+
+                  {/* Free-type input (also reflects quick-pick) */}
+                  <input
+                    value={judgeModel}
+                    onChange={e => { setJudgeModel(e.target.value); saveJudgeConfig(judgeSystemPrompt, e.target.value) }}
+                    placeholder="e.g. qwen2.5:7b"
+                    style={{ width:'100%', background:'var(--surface2)', border:`1px solid var(--purple)55`,
+                      color:'var(--fg)', fontFamily:'var(--mono)', fontSize:11, padding:'5px 8px',
+                      borderRadius:4, boxSizing:'border-box' }}
+                  />
+
+                  {/* System prompt — only when auto-judge on */}
+                  {autoJudge && (
                     <div>
                       <div style={{ fontSize:9, color:'var(--muted)', marginBottom:4 }}>SYSTEM PROMPT</div>
                       <textarea
@@ -969,8 +994,8 @@ export default function App() {
                           borderRadius:4, resize:'vertical', boxSizing:'border-box', lineHeight:1.5 }}
                       />
                     </div>
-                  </div>
-                )}
+                  )}
+                </div>
               </div>
             </div>
 
